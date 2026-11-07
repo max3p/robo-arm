@@ -1,196 +1,259 @@
-"""Arm interface, a console mock, and the real Waveshare RoArm-M2-S over USB serial.
+"""Motion API for a Waveshare RoArm-M2-S over USB serial, shared by the human CLI (cli.py) and the AI (mcp_server.py).
 
-RoArm-M2-S protocol (Waveshare wiki): 115200 baud, one JSON object per line.
-    {"T":1041,"x":..,"y":..,"z":..,"t":..}   go to XYZ (mm) + gripper angle t (rad), direct, non-blocking
-    {"T":106,"cmd":3.14,"spd":0,"acc":0}       gripper angle (3.14 closed, ~1.08 fully open)
-    {"T":105}                                  request feedback; reply {"T":1051,"x","y","z","b","s","e","t","v",..}
-    {"T":210,"cmd":0|1}                        torque off / on
-The gripper is the 4th joint, so every XYZ command carries the gripper angle or the gripper moves too.
+This module never prints or prompts: in the MCP server, stdout carries the protocol.
+The bounds box and the named paths live in arm_state.json. Only cli.py writes that file (the bounds are drawn by hand);
+the MCP server reads it once at startup and cannot change it.
+
+Every move goes through go_to(): a straight line, refused before anything is sent if the target is outside the box, out
+of reach, or the path passes too close to the base. The box is convex, so a straight line between two points inside it
+stays inside it. The box limits the claw TIP only, not the elbow or forearm: draw it smaller than the real free space.
+Opening the port resets the board, and the arm then moves to its start pose (~10 s), which may be outside the box.
+
+Protocol (Waveshare wiki), 115200 baud, one JSON object per line, angles in radians:
+    {"T":105}                              request feedback; reply {"T":1051,"x","y","z","b","s","e","t",...}
+    {"T":1041,"x":..,"y":..,"z":..,"t":..} go to XYZ (mm), direct and unsmoothed; t = gripper angle
+    {"T":106,"cmd":t,"spd","acc"}          gripper only
+    {"T":122,"b","s","e","h","spd","acc"}  joint angles in DEGREES; its spd/acc stay set for later T:1041 moves
+    {"T":102,"base","shoulder","elbow","hand","spd","acc"}   go to joint angles (spd 0 = fastest)
+    {"T":210,"cmd":0|1}                    joints free (move by hand) / locked
+    {"T":114,"led":0..255}                 gripper LED brightness
 """
 
 import json
 import math
 import threading
 import time
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
-import yaml
+import serial
+from serial.tools import list_ports
 
-CONFIG_PATH = Path(__file__).with_name("config.yaml")
-STEP_MM = 3  # RoArmSerial streams moves as small T:1041 steps: the firmware does not interpolate them
-
-
-def load_config(path=CONFIG_PATH) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
-@dataclass(frozen=True)
-class Pose:
-    x: float
-    y: float
-    z: float
-
-    def dist(self, other: "Pose") -> float:
-        return math.dist(vars(self).values(), vars(other).values())
-
-    def lerp(self, other: "Pose", f: float) -> "Pose":
-        return Pose(*(a + (b - a) * f for a, b in zip(vars(self).values(), vars(other).values())))
-
-    def as_dict(self) -> dict:
-        return {k: round(v, 1) for k, v in vars(self).items()}
-
-
-@dataclass
-class MoveResult:
-    ok: bool
-    final_pose: Pose
-    target: Pose
-    error_mm: float
-    message: str = ""
+STATE_FILE = Path(__file__).with_name("arm_state.json")
+RATE_HZ = 50        # every move is streamed as a new target this often, so a stop takes effect within 20 ms
+# Speeds measured on the arm (2026-11-07, 370 mm moves): smooth and on the line from 100 to 500 mm/s. Above ~600 the
+# servos saturate (800 asked gave ~700, 26 mm off the line). Below 100 the 50 Hz micro-steps are too small and the
+# motion turns stop-go jerky, so slower requests are raised to MIN_SPEED.
+MAX_SPEED = 500      # mm/s hard cap on the PEAK speed of any move, whatever the caller asks for
+MIN_SPEED = 100      # mm/s
+DEFAULT_SPEED = 300  # mm/s
+TOLERANCE_MM = 15   # a move that ends farther than this from the target (after the sag correction) is reported as failed
+# Under its own weight the arm stops short, worst moving UP to high, stretched poses (10-20 mm low at home). go_to then
+# aims past the target by the measured error (up to 2 passes); the aim point may be up to SAG_MAX_MM outside the box,
+# the claw is not. Sometimes (after boot, or with warm servos?) it stalls 25-35 mm low; the capped push still helps then.
+SAG_MIN_MM, SAG_MAX_MM = 3, 25
+# The firmware does not guard T:1041 against targets the arm cannot reach (its IK yields NaN, which becomes a garbage
+# servo goal), so go_to refuses them first. Targets are measured from the shoulder pivot (the x, y, z origin); the arm's
+# two links are ~239 and ~280 mm, so it reaches 41..519 mm. These limits keep well inside that. Derived from firmware constants.
+REACH_MIN_MM, REACH_MAX_MM = 100, 480
+BASE_KEEPOUT_MM = 100  # the claw must stay this far (in x, y) from the base's vertical axis: nearer is a folded arm that may hit itself
+XYZ_SERVO_SPEED_DEG = 360  # deg/s servo speed limit set before xyz moves: headroom above MAX_SPEED, not a target speed
+XYZ_SERVO_ACC_DEG = 20    # servo acceleration limit for xyz moves; 20 lags the stream least at speed (2 lagged ~25% more)
+JOINT_ACC = 10            # servo-side acceleration limit for lock()
+GRIP_CLOSED, GRIP_OPEN = 3.14, 1.08  # gripper angle t (radians), wiki default clamp range; check on the arm
+HOME = (309.0, 4.0, 228.0)  # mm: the pose the arm boots to (measured over 4 boots, 2026-11-07), gripper shut
+GRIP_SPEED, GRIP_ACC = 8.0, 50  # rad/s peak and servo acceleration: full range ~1.6 s; the servo itself caps it there
 
 
-class Arm(ABC):
-    def __init__(self, cfg: dict):
-        self.cfg = cfg
-        self.stopped = False
-
-    @abstractmethod
-    def get_pose(self) -> Pose: ...
-
-    @abstractmethod
-    def _go(self, target: Pose, speed: float) -> Pose:
-        """Move to target, wait until settled, return the measured pose."""
-
-    @abstractmethod
-    def set_gripper(self, closed: bool) -> float:
-        """Returns the measured gripper angle."""
-
-    @abstractmethod
-    def torque(self, enabled: bool) -> None: ...
-
-    def move_to(self, target: Pose, speed: float) -> MoveResult:
-        if self.stopped:
-            raise RuntimeError("arm is stopped; restart the program to move again")
-        final = self._go(target, speed)
-        error = final.dist(target)
-        ok = error <= self.cfg["tolerance_mm"]
-        return MoveResult(ok, final, target, round(error, 1),
-                          "" if ok else f"arm ended {error:.0f} mm from the target (unreachable or blocked?)")
-
-    def stop(self) -> None:
-        """Emergency stop: refuse further motion, hold position with torque on."""
-        self.stopped = True
-        self.torque(True)
-
-    def close(self) -> None:
-        pass
+def load_state() -> dict:
+    """{"bounds": {"x": [lo, hi], "y": .., "z": ..} or None, "bounds_drawn": iso time, "paths": {name: [[x, y, z, t], ..]}}"""
+    try:
+        state = json.loads(STATE_FILE.read_text())
+    except FileNotFoundError:
+        state = {}
+    return {"bounds": None, "bounds_drawn": None, "paths": {}} | state
 
 
-class MockArm(Arm):
-    """Logs commands to the console. drift_mm offsets every final pose along x; targets farther
-    than reach_mm from the base stop short. Both exist to exercise the error paths."""
+def save_state(state: dict) -> None:
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=1))
+    tmp.replace(STATE_FILE)  # atomic: a crash mid-write cannot leave a half-written bounds file
 
-    def __init__(self, cfg: dict, drift_mm: float = 0.0, reach_mm: float | None = None):
-        super().__init__(cfg)
-        self.pose = Pose(*cfg["home"])
-        self.drift_mm, self.reach_mm = drift_mm, reach_mm
 
-    def get_pose(self) -> Pose:
-        return self.pose
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
-    def _go(self, target, speed):
-        print(f"[MOCK ARM] move_to x={target.x:.1f} y={target.y:.1f} z={target.z:.1f} speed={speed:.0f}")
-        reach = math.dist((0, 0, 0), vars(target).values())
-        f = min(1.0, self.reach_mm / reach) if self.reach_mm else 1.0
-        self.pose = Pose(target.x * f + self.drift_mm, target.y * f, target.z * f)
-        return self.pose
 
-    def set_gripper(self, closed):
-        print(f"[MOCK ARM] gripper {'close' if closed else 'open'}")
-        return self.cfg["gripper"]["closed" if closed else "open"]
-
-    def torque(self, enabled):
-        print(f"[MOCK ARM] torque {'on' if enabled else 'off'}")
+def check_target(bounds: dict, x, y, z) -> None:
+    """Raise ValueError unless (x, y, z) is numbers inside the box and the arm's safe reach."""
+    for axis, v in dict(x=x, y=y, z=z).items():
+        lo, hi = bounds[axis]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:  # also rejects NaN
+            raise ValueError(f"{axis} must be a number in [{lo:g}, {hi:g}], got {round(v, 1) if isinstance(v, float) else v!r}")
+    if not REACH_MIN_MM <= math.dist((0, 0, 0), (x, y, z)) <= REACH_MAX_MM:
+        raise ValueError(f"({x:g}, {y:g}, {z:g}) is outside the arm's safe reach "
+                         f"({REACH_MIN_MM}-{REACH_MAX_MM} mm from the shoulder pivot)")
 
 
 def find_port() -> str:
-    from serial.tools import list_ports
-    ports = [p.device for p in list_ports.comports() if p.vid]  # USB devices only
+    ports = [p.device for p in list_ports.comports() if p.vid]  # USB serial devices only
     if len(ports) != 1:
-        raise RuntimeError(f"cannot pick the arm's serial port (found {ports or 'none'}); pass --port")
+        raise RuntimeError(f"cannot pick the arm's port (found {ports or 'none'}); pass it as Arm(bounds, port)")
     return ports[0]
 
 
-class RoArmSerial(Arm):
-    def __init__(self, cfg: dict, port: str | None = None, ser=None):
-        super().__init__(cfg)
-        self.lock = threading.Lock()
-        if ser is None:
-            import serial
-            ser = serial.Serial()
-            ser.port, ser.baudrate, ser.timeout = port or find_port(), 115200, 0.2
-            ser.dtr = ser.rts = False  # set before open: asserting them holds the ESP32 in reset
-            ser.open()
-            time.sleep(2)  # let the firmware finish booting
-        self.ser = ser
-        fb = self.feedback()
-        self.t = fb["t"]  # commanded gripper angle, sent with every move
-        print(f"[ROARM] {ser.port}: x={fb['x']:.0f} y={fb['y']:.0f} z={fb['z']:.0f} "
-              f"gripper={fb['t']:.2f} supply={fb.get('v', 0) / 100:.1f} V")
+class Arm:
+    def __init__(self, bounds: dict | None, port: str | None = None):
+        self.target = None  # last (x, y, z) go_to aimed for: move_by builds on it, so sag does not add up
+        self.bounds = bounds  # {"x": (lo, hi), "y": ..., "z": ...} in mm; every move is refused while this is None
+        self.lock_ = threading.RLock()  # one physical action at a time (MCP tools run in worker threads)
+        self.ser = serial.Serial()
+        self.ser.port, self.ser.baudrate, self.ser.timeout = port or find_port(), 115200, 0.2
+        self.ser.dtr = self.ser.rts = False  # set before open(): asserting them holds the ESP32 in reset
+        self.ser.open()
+        deadline = time.monotonic() + 25  # the arm moves to its start pose while it boots
+        while True:
+            try:
+                self._feedback()
+                break
+            except RuntimeError:
+                if time.monotonic() > deadline:
+                    self.ser.close()
+                    raise RuntimeError("arm never answered; is the 12 V adapter plugged in and switched on?")
 
     def _send(self, cmd: dict) -> None:
         self.ser.write((json.dumps(cmd) + "\n").encode())
 
-    def feedback(self) -> dict:
-        with self.lock:
+    def _feedback(self) -> dict:
+        with self.lock_:
             self.ser.reset_input_buffer()
-            self._send({"T": 105})
+            self.ser.write(b'{"T":105}\n')
             deadline = time.monotonic() + 1.0
             while time.monotonic() < deadline:
                 try:
                     msg = json.loads(self.ser.readline())
-                except ValueError:  # boot messages, echoes, partial lines, read timeouts
+                except ValueError:  # boot text, echoes, partial lines, read timeouts
                     continue
                 if isinstance(msg, dict) and msg.get("T") == 1051:
                     return msg
-        raise RuntimeError("no T:1051 feedback from the arm")
+        raise RuntimeError("no feedback")
 
-    def get_pose(self) -> Pose:
-        fb = self.feedback()
-        return Pose(fb["x"], fb["y"], fb["z"])
+    def read(self) -> tuple[float, float, float, float]:
+        """Measured (x, y, z, t): claw position in mm and gripper angle in radians."""
+        fb = self._feedback()
+        return fb["x"], fb["y"], fb["z"], fb["t"]
 
-    def _go(self, target, speed):
-        start = self.get_pose()
-        n = max(1, math.ceil(start.dist(target) / STEP_MM))
-        for i in range(1, n + 1):
-            p = start.lerp(target, i / n)
-            with self.lock:
-                self._send({"T": 1041, "x": round(p.x, 1), "y": round(p.y, 1), "z": round(p.z, 1), "t": self.t})
-            time.sleep(start.dist(target) / n / speed)
-        # The firmware reports no "move finished"; settled = two consecutive reads agree.
-        last, deadline = self.get_pose(), time.monotonic() + self.cfg["settle_timeout_s"]
+    def joints(self) -> tuple[float, float, float, float]:
+        fb = self._feedback()
+        return fb["b"], fb["s"], fb["e"], fb["t"]
+
+    def _glide(self, start, goal, duration, make_cmd) -> None:
+        """Stream targets from start to goal in a straight line, speeding up and slowing down smoothly (smoothstep: speed
+        0 at both ends, peak 1.5x the average)."""
+        t0 = time.monotonic()  # positions come from the clock, not from summed sleeps, so timing jitter cannot cause jerks
+        while True:
+            u = min((time.monotonic() - t0) / duration, 1.0)
+            f = u * u * (3 - 2 * u)
+            self._send(make_cmd([a + (b - a) * f for a, b in zip(start, goal)]))
+            if u >= 1.0:
+                return
+            time.sleep(1 / RATE_HZ)
+
+    def _settle(self, read, eps):
+        """The firmware has no 'move finished' signal: settled = two consecutive reads agree to within eps."""
+        last = now = read()
+        deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             time.sleep(0.1)
-            pose = self.get_pose()
-            if pose.dist(last) < 0.5:
+            now = read()
+            if math.dist(now, last) < eps:
                 break
-            last = pose
-        return pose
+            last = now
+        return now
 
-    def set_gripper(self, closed):
-        # Keep the commanded angle for later moves: re-sending the measured one would loosen a grip.
-        self.t = self.cfg["gripper"]["closed" if closed else "open"]
-        with self.lock:
-            self._send({"T": 106, "cmd": self.t, "spd": 0, "acc": 0})
-        time.sleep(1.0)
-        return self.feedback()["t"]
+    def go_to(self, x: float, y: float, z: float, speed: float = DEFAULT_SPEED, t: float | None = None):
+        """Move the claw to (x, y, z) mm in a straight line at `speed` mm/s (peak), and the gripper to angle t (None = keep
+        it). Returns the measured final (x, y, z). Raises ValueError, before anything moves, if the target is outside the
+        bounds or reach or the path passes too near the base; RuntimeError if the arm does not get there."""
+        if not self.bounds:
+            raise RuntimeError("no bounds: draw them first with cli.py")
+        check_target(self.bounds, x, y, z)
+        if t is not None and not GRIP_OPEN <= t <= GRIP_CLOSED:
+            raise ValueError(f"gripper angle {t!r} is not in [{GRIP_OPEN}, {GRIP_CLOSED}]")
+        speed = min(max(speed, MIN_SPEED), MAX_SPEED)
+        with self.lock_:
+            fb = self._feedback()
+            start, goal = (fb["x"], fb["y"], fb["z"]), (x, y, z)
+            d = [g - a for a, g in zip(start[:2], goal[:2])]  # closest approach of the straight path to the base axis, in plan view
+            f = min(max(-sum(a * v for a, v in zip(start, d)) / (sum(v * v for v in d) or 1), 0), 1)
+            closest = math.hypot(*(a + f * v for a, v in zip(start, d)))
+            if closest < BASE_KEEPOUT_MM and closest < math.hypot(*start[:2]) - 0.5:  # moving away from the base is always allowed
+                raise ValueError(f"the straight path to ({x:g}, {y:g}, {z:g}) passes {closest:.0f} mm from the base axis "
+                                 f"(keep-out {BASE_KEEPOUT_MM} mm); choose a target that avoids it")
+            # T:1041 takes its servo speed and acceleration from firmware globals, and every T:102 (lock) resets them
+            # to 0 = unlimited, which turns 50 Hz micro-steps into stop-go jerks. T:122 sets them and leaves them set, so
+            # send it first with the current angles (no motion).
+            b, sh, e, h = (math.degrees(fb[k]) for k in "bset")
+            self._send({"T": 122, "b": b, "s": sh, "e": e, "h": h, "spd": XYZ_SERVO_SPEED_DEG, "acc": XYZ_SERVO_ACC_DEG})
+            t = fb["t"] if t is None else t
+            self._glide((*start, fb["t"]), (*goal, t), max(math.dist(start, goal) * 1.5 / speed, 0.2),
+                        lambda p: {"T": 1041, "x": round(p[0], 1), "y": round(p[1], 1), "z": round(p[2], 1),
+                                   "t": round(p[3], 3)})
+            self.target = goal
+            now = self._settle(lambda: self.read()[:3], 0.5)
+            aim = goal
+            for _ in range(2):  # aim past the target by what it missed; the push past `goal` never exceeds SAG_MAX_MM
+                if math.dist(now, goal) <= SAG_MIN_MM:
+                    break
+                push = [a - n for a, n in zip(aim, now)]  # (aim - goal) + (goal - now): the old push plus the new miss
+                k = min(1, SAG_MAX_MM / math.hypot(*push))
+                new = [g + p * k for g, p in zip(goal, push)]
+                if math.dist((0, 0, 0), new) > REACH_MAX_MM + SAG_MAX_MM:
+                    break
+                self._glide((*aim, t), (*new, t), 0.3, lambda p: {"T": 1041, "x": round(p[0], 1), "y": round(p[1], 1),
+                                                                  "z": round(p[2], 1), "t": round(p[3], 3)})
+                aim, now = new, self._settle(lambda: self.read()[:3], 0.5)
+        error = math.dist(now, goal)
+        if error > TOLERANCE_MM:
+            raise RuntimeError(f"arm ended {error:.0f} mm from the target, at ({now[0]:.0f}, {now[1]:.0f}, {now[2]:.0f}): "
+                               "sagging under load, or blocked. It is safe where it is")
+        return now
 
-    def torque(self, enabled):
-        with self.lock:
-            self._send({"T": 210, "cmd": int(enabled)})
+    def gripper(self, t: float) -> float:
+        """Move only the gripper to angle t (GRIP_CLOSED = shut, GRIP_OPEN = wide). Returns the measured angle, which
+        stops short of t when the gripper closes on something."""
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not GRIP_OPEN <= t <= GRIP_CLOSED:
+            raise ValueError(f"gripper angle {t!r} is not in [{GRIP_OPEN}, {GRIP_CLOSED}]")
+        with self.lock_:  # streamed like go_to: a single T:106 starts late, and _settle mistook that for done
+            t0 = self.read()[3]
+            self._glide((t0,), (t,), max(abs(t - t0) * 1.5 / GRIP_SPEED, 0.2),
+                        lambda p: {"T": 106, "cmd": round(p[0], 3), "spd": 0, "acc": GRIP_ACC})
+            return self._settle(lambda: self.read()[3:], 0.01)[0]
 
-    def close(self):
+    def play(self, points: list, speed: float = DEFAULT_SPEED) -> None:
+        """Visit [x, y, z, t] points in order with go_to (straight lines, gripper interpolated). Every point is checked
+        against the bounds before anything moves, so a path recorded under older, bigger bounds is refused whole."""
+        if not points:
+            raise ValueError("the path is empty")
+        for i, (x, y, z, _) in enumerate(points, 1):
+            try:
+                check_target(self.bounds or {}, x, y, z)
+            except (ValueError, KeyError) as e:
+                raise ValueError(f"point {i} of the path is not allowed: {e or 'no bounds'}") from None
+        with self.lock_:
+            for x, y, z, t in points:
+                self.go_to(x, y, z, speed, min(max(t, GRIP_OPEN), GRIP_CLOSED))
+
+    def led(self, level: int) -> None:
+        """Gripper LED brightness, 0 (off) .. 255 (full). Tested on the arm 2026-11-07. The arm does not report it back."""
+        if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 255:
+            raise ValueError(f"LED level {level!r} is not an integer in [0, 255]")
+        with self.lock_:
+            self._send({"T": 114, "led": level})
+
+    def free(self) -> None:
+        """Torque off: the joints go limp so the arm can be moved by hand. Human use only."""
+        self._send({"T": 210, "cmd": 0})
+
+    def lock(self) -> None:
+        """Lock the joints where they are now. A rotation command re-locks them, so command the measured angles."""
+        with self.lock_:
+            b, s, e, h = self.joints()
+            self._send({"T": 102, "base": b, "shoulder": s, "elbow": e, "hand": h, "spd": 0, "acc": JOINT_ACC})
+            time.sleep(0.2)
+            fb = self._feedback()
+            if not all(fb[k] for k in ("torswitchB", "torswitchS", "torswitchE", "torswitchH")):
+                self._send({"T": 210, "cmd": 1})  # fallback: plain torque on
+
+    def close(self) -> None:
         self.ser.close()

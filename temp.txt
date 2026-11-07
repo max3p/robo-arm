@@ -1,0 +1,6 @@
+arm> record
+Torque goes OFF and the arm will sag under its own weight. Support it, then press Enter...
+rec[0]>            <- move the arm by hand, press Enter to save the pose
+  point 1: x=.. y=.. z=..
+rec[1]> q          <- q + Enter stops; the arm locks where it is
+arm> play(15)      <- replay once at 15 deg/s (default 20, capped at 45)
