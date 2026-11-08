@@ -3,7 +3,8 @@
 The bounds and paths are read from arm_state.json once, at startup; no tool can change them. They are sent to the model
 before it does anything (in the server instructions and in each motion tool's description). Moves are capped at
 MAX_SPEED (raised to MIN_SPEED when slower) and every target is checked by arm.go_to before anything is sent.
-The serial port opens on the first tool call that needs the arm, which resets the board (~10 s to its start pose).
+The serial port opens on the first tool call that needs the arm, which resets the board (~10 s to its boot pose), then
+the arm moves to the resting pose START.
 
     claude mcp add robo-arm -- /path/to/.venv/bin/python /path/to/mcp_server.py
 """
@@ -17,7 +18,7 @@ from typing import Literal
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from arm import (BASE_KEEPOUT_MM, DEFAULT_SPEED, HOME, MAX_SPEED, MIN_SPEED, GRIP_CLOSED, GRIP_OPEN, REACH_MAX_MM,
+from arm import (BASE_KEEPOUT_MM, DEFAULT_SPEED, START, MAX_SPEED, MIN_SPEED, GRIP_CLOSED, GRIP_OPEN, REACH_MAX_MM,
                  REACH_MIN_MM, TOLERANCE_MM, Arm, load_state)
 from gestures import GESTURES, look_at as look_keys
 
@@ -38,6 +39,7 @@ INSTRUCTIONS = (f"Controls a real 4-DOF desk robot arm (Waveshare RoArm-M2-S) th
                 "It is meant to act like a pet: use `gesture` and `look_at` to react with body language. "
                 "Gestures play wherever the claw is and facing, so chain them with look_at and moves: e.g. look_at a "
                 "person, curious, turn the other way, nod. "
+                f"It starts at the resting pose {START} (go_home returns there). "
                 "Every result reports the measured pose. When a move is refused, pick a target inside the limits "
                 "instead of repeating it. Moves block until the arm has settled.")
 
@@ -108,10 +110,11 @@ def move_by(dx: float = 0, dy: float = 0, dz: float = 0, speed: float = DEFAULT_
     return pose()
 
 
-@tool(f"Return to the starting pose the arm boots to: claw at (x, y, z) = {HOME} mm, gripper shut. "
-      "Straight-line move, same limits as move_to.")
+@tool(f"Return to the resting pose: claw folded back over the base at (x, y, z) = {START} mm, gripper shut. The arm "
+      "moves there when it connects, and it is the pose to rest in and come back to between things. Straight-line move, "
+      "same limits as move_to.")
 def go_home(speed: float = DEFAULT_SPEED) -> dict:
-    arm().go_to(*HOME, speed, GRIP_CLOSED)
+    arm().go_to(*START, speed, GRIP_CLOSED)
     return pose()
 
 

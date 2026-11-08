@@ -4,7 +4,7 @@
         read                    print the claw position (mm) and gripper angle
         move(x, y, z[, speed])  straight-line move inside the box, speed in mm/s
         grip(t)                 gripper angle in radians (3.14 shut .. 1.08 wide)
-        home                    back to the pose the arm boots to, gripper shut
+        home                    back to the resting pose START (folded back), gripper shut
         led(n)                  gripper LED brightness, 0 (off) .. 255
         bounds                  draw the box again: free the arm and sweep the claw around the space it may use
                                 (sampled every 100 ms; the min and max of x, y and z become the box). Saved at once.
@@ -24,7 +24,7 @@ import math
 import select
 import sys
 
-from arm import GRIP_CLOSED, HOME, MAX_SPEED, Arm, check_target, load_state, now_iso, save_state
+from arm import GRIP_CLOSED, START, MAX_SPEED, Arm, check_target, load_state, now_iso, save_state
 from gestures import GESTURES, look_at
 
 SAMPLE_S = 0.1   # the bounds sweep samples the claw position this often
@@ -139,7 +139,7 @@ def main() -> None:
                 elif cmd == "grip" and len(args) == 1:
                     print("gripper t=%.2f" % arm.gripper(float(args[0])))
                 elif cmd == "home" and not args:
-                    print("final x=%.1f y=%.1f z=%.1f" % arm.go_to(*HOME, t=GRIP_CLOSED))
+                    print("final x=%.1f y=%.1f z=%.1f" % arm.go_to(*START, t=GRIP_CLOSED))
                 elif cmd == "led" and len(args) == 1:
                     arm.led(int(args[0]))
                 elif cmd == "bounds" and not args:

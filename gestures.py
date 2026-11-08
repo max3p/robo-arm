@@ -9,7 +9,7 @@ Durations keep moves at roughly 100 mm/s or more: slower than that the arm moved
 
 import math
 
-from arm import REACH_MAX_MM
+from arm import REACH_MAX_MM, START
 
 
 def K(secs, dr=0, da=0, dz=0, grip=None, led=None):
@@ -26,11 +26,6 @@ def clamp(v, lo, hi, margin=20):
     return min(max(v, lo + margin), hi - margin)
 
 
-def ready(bounds):
-    """A pose with room around it for every relative gesture: centred, 80 mm below the top of the box."""
-    return clamp(300, *bounds["x"]), clamp(0, *bounds["y"]), bounds["z"][1] - 80
-
-
 def sleep(ref, bounds):
     """Folds up: the claw goes down and back, close in over the base, facing forward."""
     rest = toward(ref, clamp(150, *bounds["x"]), clamp(0, *bounds["y"]), bounds["z"][0] + 30)
@@ -39,12 +34,12 @@ def sleep(ref, bounds):
 
 
 def wake_up(ref, bounds):
-    """Stretches as high and as far out as the box allows, with the arm nearly straight, then settles at ready()."""
+    """Stretches as high and as far out as the box allows, with the arm nearly straight, then settles at START."""
     z = bounds["z"][1] - 5
     r = min(math.sqrt(max((REACH_MAX_MM - 10) ** 2 - z * z, 0)), bounds["x"][1] - 20)
     stretch = toward(ref, r, clamp(0, *bounds["y"]), z)
     return [K(.3, dz=20, led=60), K(.3, led=0), K(1.6, *stretch, grip=0, led=255), K(.5, *stretch, grip=1, led=255),
-            K(.6, *stretch, grip=1, led=255), K(.4, *stretch, grip=0, led=255), K(1.0, *toward(ref, *ready(bounds)), grip=0, led=0)]
+            K(.6, *stretch, grip=1, led=255), K(.4, *stretch, grip=0, led=255), K(1.0, *toward(ref, *START), grip=0, led=0)]
 
 
 def look_at(x, y, z):
@@ -85,5 +80,5 @@ GESTURES = {  # name: (what it says, keyframes)
                  K(.6, dr=-25, dz=15, grip=.2), K(.5, dr=-25, dz=15, grip=.2), K(.45)]),
     "sleep": ("long idle, 'goodnight': folds down and back to a low rest, light breathes, then goes dark. Stays there", sleep),
     "wake_up": ("start of a session, called by name: stirs, stretches up high with a wide-open yawn while the light comes "
-                "up, then settles at the ready pose", wake_up),
+                "up, then settles back at the resting pose", wake_up),
 }

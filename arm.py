@@ -54,6 +54,9 @@ XYZ_SERVO_ACC_DEG = 20    # servo acceleration limit for xyz moves; 20 lags the 
 JOINT_ACC = 10            # servo-side acceleration limit for lock()
 GRIP_CLOSED, GRIP_OPEN = 3.14, 1.08  # gripper angle t (radians), wiki default clamp range; check on the arm
 HOME = (309.0, 4.0, 228.0)  # mm: the pose the arm boots to (measured over 4 boots, 2026-11-07), gripper shut
+# The firmware's boot pose is an upside-down L, stretched forward: the worst pose for sag. START is folded back over the
+# base (set by hand by the user, 2026-11-07). Arm() moves there right after boot, and it is the resting pose.
+START = (161.5, -2.0, 213.6)
 GRIP_SPEED, GRIP_ACC = 8.0, 50  # rad/s peak and servo acceleration: full range ~1.6 s; the servo itself caps it there
 
 
@@ -127,6 +130,7 @@ def find_port() -> str:
 
 class Arm:
     def __init__(self, bounds: dict | None, port: str | None = None):
+        """Open the port (which resets the board: the arm moves to its boot pose, HOME) and, given bounds, move to START."""
         self.target = None  # last (x, y, z) go_to aimed for: move_by builds on it, so sag does not add up
         self.commanded = None  # last (x, y, z) actually sent: the target plus the sag correction
         self.led_level = 0  # the arm does not report its LED; it boots dark
@@ -145,6 +149,12 @@ class Arm:
                 if time.monotonic() > deadline:
                     self.ser.close()
                     raise RuntimeError("arm never answered; is the 12 V adapter plugged in and switched on?")
+        if bounds:  # wait out the boot motion, then leave its sag-prone pose for START (skipped if START is outside the box)
+            self._settle(lambda: self.read()[:3], 0.5, timeout=15)
+            try:
+                self.go_to(*START, speed=200, t=GRIP_CLOSED)
+            except ValueError:
+                pass
 
     def _send(self, cmd: dict) -> None:
         self.ser.write((json.dumps(cmd) + "\n").encode())
@@ -184,10 +194,10 @@ class Arm:
                 return
             time.sleep(1 / RATE_HZ)
 
-    def _settle(self, read, eps):
+    def _settle(self, read, eps, timeout=5):
         """The firmware has no 'move finished' signal: settled = two consecutive reads agree to within eps."""
         last = now = read()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             time.sleep(0.1)
             now = read()
