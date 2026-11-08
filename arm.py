@@ -16,7 +16,7 @@ Three parts run side by side and talk only through queues, so none waits for ano
   left of older replies and stops the motion in progress (Arm.abort, within 20 ms). With nothing to do it idles by
   itself, without the brain (no API calls): straight after its last movement it goes back to rest, then fidgets from
   MOODS that grow from content to bored to sleepy, until it falls asleep (the next movement wakes it first). Someone starting to talk
-  stops an idle move and holds off the next, like a pet listening.
+  stops an idle move: it perks up and leans forward, and holds there while it listens.
 New messages and failed actions wake the brain; finished actions and mood changes are only noted for its next turn.
 The conversation is only ever appended to, never edited: that keeps the prompt cache and Claude's thinking valid.
 
@@ -43,7 +43,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from ears import Ears
 from motion import (DEFAULT_SPEED, GRIP_CLOSED, GRIP_OPEN, MAX_SPEED, MIN_SPEED, START, Arm, Interrupted,
                     describe_limits, load_state)
-from gestures import GESTURES, look_at
+from gestures import GESTURES, listen, look_at
 
 # Speed first: Haiku, at low effort (it thinks less, and skips thinking on simple turns). If it seems too dim, raise
 # EFFORT to "medium", or use "claude-sonnet-5-5" or "claude-opus-5-5" (slower; Opus is the cleverest).
@@ -218,11 +218,17 @@ class Body:
         threading.Thread(target=self._run, daemon=True).start()
 
     def hush(self) -> None:
-        """Someone started talking: stop an idle move (gen None) and hold off the next, like a pet listening."""
+        """Someone started talking: like a pet, stop idling (gen None), perk up and lean forward, and hold off
+        idling for HUSH_S. Not while asleep or while the brain's movements play; the brain's next movement replaces it."""
         with self.cv:
             self.hushed = time.monotonic()
-            if self.gen is None:
-                self._drop()
+            if self.asleep or (self.gen is not None and (self.busy or self.todo)):
+                return
+            self._drop()
+            self.gen, self.away = None, True  # away: idling starts again by going home
+            self.todo.append(("idle: listen", lambda: self.arm.perform(listen)))
+            self.cv.notify()
+            self.idling("listen")
 
     def do(self, gen: int, label: str, fn) -> None:
         with self.cv:

@@ -10,7 +10,7 @@ Phase 1. The gentle ones (lean_in, calm) are slower on purpose; check them by ey
 
 import math
 
-from motion import REACH_MAX_MM, START
+from motion import REACH_MAX_MM, START, check_target
 
 
 def K(secs, dr=0, da=0, dz=0, grip=None, led=None):
@@ -52,6 +52,19 @@ def look_at(x, y, z):
         return [K(.7, da=da, dz=dz / 2), K(.3, dr=35, da=da, dz=dz / 2 + 12), K(.4, dr=35, da=da, dz=dz / 2 + 12),
                 K(.4, da=da, dz=dz / 2)]
     return keys
+
+
+def listen(ref, bounds):
+    """Attentive: without turning, lean up to 50 mm forward (less near the edge of the box) and lift the head up near
+    the top of the box, and stay there. At rest the claw is already near the top, so it mostly leans."""
+    z, r = max(bounds["z"][1] - 10, ref[2]), math.hypot(*ref[:2])
+    for dr in (50, 30, 15, 0):
+        try:
+            check_target(bounds, *(c * (r + dr + 5) / r for c in ref[:2]), z)  # 5 mm spare
+            break
+        except ValueError:
+            pass
+    return [K(.6, dr=dr, dz=z - ref[2])]
 
 
 def bounce(times, dr, up, down, da, secs):

@@ -440,8 +440,12 @@ static, 2026-11-07.)
 2. **The brain always wins.** Idle moves are queued like a cut-off reply (`gen = None`), so the first movement of any
    reply stops them. Only the brain's own movements reset the quiet clock: if it decides speech isn't for it (the
    TV), the boredom carries on.
-3. **Someone starting to talk** (the ears' `speech` event) stops an idle move at once and holds off the next for
-   `HUSH_S` (8 s), like a pet pricking up its ears. It also keeps the motors quiet while the mic listens.
+3. **Someone starting to talk** (the ears' `speech` event) stops an idle move at once. The arm perks up where it
+   faces, without turning (the user's call): `gestures.listen` leans up to 50 mm forward (less near the box edge) and lifts to near the top of the
+   box, and holds there. The brain's first movement replaces it ~2 s after the person stops. Idling waits `HUSH_S`
+   (8 s) from the start of speech, then starts again by going home, e.g. after a cough the ears drop. No perk while
+   asleep, or while the brain's own movements play. Tested on the real arm (2026-11-07): from a low glance it rose
+   from z 137 to 223.
 4. **Waking is in code:** if it is asleep, the first movement of a reply plays `wake_up` first. In testing, Haiku
    ignored the prompt's "wake_up first" and played `excited` from the low sleep pose. If the brain doesn't move at
    all, it sleeps on.
