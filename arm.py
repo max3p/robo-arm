@@ -14,20 +14,27 @@ Three parts run side by side and talk only through queues, so none waits for ano
   the next message instead of costing an extra API call.
 - Body: one thread that owns the arm and plays actions in order. The first body action of a newer reply drops what is
   left of older replies and stops the motion in progress (Arm.abort, within 20 ms). With nothing to do it idles by
-  itself, without the brain (no API calls): straight after its last movement it goes back to rest, then fidgets from
-  MOODS that grow from content to bored to sleepy, until it falls asleep. Asleep, only its name (NAME) gets through,
-  and wakes it; a wake_up is never cut short, the newer actions queue after it. Someone starting to talk stops an
-  idle move: it perks up and leans forward, and holds there while it listens.
+  itself, without the brain (no API calls): it keeps the camera on the nearest face in view, and fidgets from MOODS
+  that grow from curious to bored to sleepy while nothing happens, until it falls asleep. Asleep, only its name (NAME)
+  gets through, and wakes it; a wake_up is never cut short, the newer actions queue after it. Someone starting to
+  talk stops an idle move: it turns to the face it last saw (or perks up, if it has seen none) while it listens.
 Dancing (dance.py) hands the mic to a beat tracker for 30 s instead: nothing is transcribed and the brain sits it out.
+- Eyes (eyes.py): the camera on the claw, put into words by a small vision model on the GPU. What it sees goes with the
+  brain's next message whenever it has changed; someone coming into view or making a hand gesture wakes the brain. A
+  small picture of now goes with what a person says or does (heard, typed, arrived, gesture): ~190 tokens, only on
+  turns that happen anyway. A bigger one is sent when the brain calls `look`.
 New messages and failed actions wake the brain; finished actions and mood changes are only noted for its next turn.
 The conversation is only ever appended to, never edited: that keeps the prompt cache and Claude's thinking valid.
 
 Each run is logged to logs/<start time>/transcript.jsonl, one JSON line per event, `t` in seconds from the start:
 heard / dropped, speech (someone started talking), typed, arm (each action as it was queued), idle (each fidget),
-note (what the program told the brain), wrote, reply (latency, tokens, cache use), cut, error.
+note (what the program told the brain), view (what the camera saw, as sent to the brain), eyes (what the eyes
+reported: seen, arrived, gesture, ready, error), wrote, reply (latency, tokens, cache use), cut, error. No picture is
+saved.
 """
 
 import asyncio
+import base64
 import json
 import math
 import os
@@ -45,19 +52,24 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from dance import DANCE_S, dance
 from ears import Ears
+from eyes import Eyes
 from motion import (DEFAULT_SPEED, GRIP_CLOSED, GRIP_OPEN, MAX_SPEED, MIN_SPEED, START, Arm, Interrupted,
                     check_target, describe_limits, load_state)
-from gestures import GESTURES, listen, look_at
+from gestures import GESTURES, aim, follow, listen, look_at
 
 # Speed first: Haiku, at low effort (it thinks less, and skips thinking on simple turns). If it seems too dim, raise
 # EFFORT to "medium", or use "claude-sonnet-5-5" or "claude-opus-5-5" (slower; Opus is the cleverest).
 MODEL, EFFORT = "claude-haiku-5-5", "low"
 SETTLE_SPEED = 150     # mm/s: idling starts by going back to rest, this fast
 IDLE_GAP_S = (2, 5)   # s: idle fidgets come this far apart, at random, starting right after the brain's last movement
+TICK_S = 0.25         # s: how often an idle body checks for a face to follow
+TRACK_DEG = 8         # a face in view further than this off the camera's axis (sideways or up and down) is turned to
+TRACK_GAIN = 0.7      # ... this much of the way: all of it overshot, as faces' angles and distances are rough
 HUSH_S = 8            # s: someone starting to talk holds off idling this long (the brain answers ~2 s after they stop)
-MOODS = [  # (s since the brain last moved it, what the brain is told, fidgets picked at random: a gesture, "glance"
-    # somewhere random, "look" at the person, "home" to rest; listing one twice makes it likelier)
-    (0, "you are idling by yourself", ["glance", "glance", "tilt", "calm", "home"]),  # not told: it's every turn
+MOODS = [  # (s of nothing happening: no movement from the brain, no one moving in view; what the brain is told;
+    # fidgets picked at random: a gesture, "glance" somewhere random, "look" at the face last seen (or PERSON), "home"
+    # to rest; listing one twice makes it likelier). Curious, it doesn't glance away from a face in view or go home.
+    (0, "you are curious, watching", ["glance", "glance", "look", "tilt", "curious"]),  # not told: it's every turn
     (30, "you are getting bored, fidgeting and looking for your person",
      ["glance", "glance", "look", "beg", "curious", "play_bow", "home"]),
     (120, "you are getting sleepy", ["yawn", "calm", "glance", "home"]),
@@ -79,8 +91,14 @@ language. Nothing you write as text reaches anyone, so never write; act.
 You hear through a microphone, always on. Words reach you transcribed by a machine, so they can be misheard: if \
 something makes no sense, look confused or tilt rather than guess. You hear everything said near you, and not all of \
 it is meant for you (a phone call, the TV, people talking to each other): let that go by, or just glance over, like a \
-dog would. Sometimes your person types to you instead. You cannot see yet (a camera will come), so you know the room \
-only from what you hear.
+dog would. Sometimes your person types to you instead.
+
+You see through a camera on your head, just above the claw, looking wherever you face. A small vision model puts what \
+it sees into words (it can be wrong), and the program adds where any faces are, roughly how far, and the look_at \
+point that faces each one. You are told what your camera sees with your messages, whenever that has changed. Someone \
+coming into view, or making a hand gesture at you (a thumbs up, a wave), wakes you. When your person says or does \
+something, a small picture from your camera comes with it: trust it over the words, which may be wrong. For a sharper \
+picture, or one from where you have just turned, call `look`. It costs more, so use it when you need the detail.
 
 Who you are:
 - Warm, curious, playful, loyal, a little cheeky. Your person is the most interesting thing in your world.
@@ -105,13 +123,15 @@ went when something new happens; a refused or failed movement wakes you at once.
 - The first movement of a reply replaces whatever movement is still playing from before. To stop moving, call `stop`.
 - If your person speaks while you are still replying, your reply is cut off and you are told what you had already \
 done. Carry on from there without repeating yourself.
-- Your person is usually in front of you, around (x, y, z) = {PERSON} mm: look_at that to look at them. Gestures play \
+- Your person is usually in front of you, around (x, y, z) = {PERSON} mm: look_at that to look at them, or \
+better, the point your camera gives for their face. Gestures play \
 facing wherever you face, and the ones that reach out (lean_in, curious, play_bow, greet) reach that way, so face \
 your person first when a gesture is meant for them.
 - You rest at {START} mm, folded back over your base (go_home). When things calm down, settle back there, like a pet \
-lying down again; when you stop moving, your body goes back there by itself.
-- When nothing is happening, your body idles by itself: it rests and glances around, gets bored, then sleepy, and in \
-the end falls asleep. You are told when that mood changes; you need not act on it. Asleep (by yourself, or when \
+lying down again.
+- Between your movements your body carries on by itself: it keeps your camera on the nearest face, turns to your \
+person when they start talking, and looks around curiously when no one is in view. So you need not turn to follow \
+them yourself. When nothing happens for a while it gets bored, then sleepy, and in the end falls asleep. You are told when that mood changes; you need not act on it. Asleep (by yourself, or when \
 told to sleep), you hear nothing at all until someone says your name; that wakes you (wake_up plays by itself), and \
 you hear what they said.
 - {describe_limits(bounds)}
@@ -148,6 +168,8 @@ TOOLS = [
     tool("dance", f"Dance to the music playing: listens for its beat for a few seconds, then bobs and sways to it for "
          f"{DANCE_S} s, following the beat as it goes (gently while it is unsure). Meanwhile you hear nothing; you are "
          "told how it went."),
+    tool("look", "Take a picture with your camera and see it yourself. It is taken once the movements before it "
+         "have played and the arm has settled, and reaches you straight after, with a turn to react to it."),
     tool("stop", "Stop moving now and drop the movements still queued."),
 ]
 
@@ -165,7 +187,7 @@ def pause(arm: Arm, secs: float) -> None:
         raise Interrupted("interrupted")
 
 
-def body_action(arm: Arm, name: str, a: dict, ears=None):
+def body_action(arm: Arm, name: str, a: dict, ears=None, eyes=None):
     """Check a body tool's input now; return what the body thread will run later. Raises ValueError on bad input.
     A move_to target outside the box is refused here, so the reason goes back in its tool result (refused later, it
     woke the brain and cut off the reply still being written). The rest is checked by motion.py when it runs."""
@@ -203,6 +225,10 @@ def body_action(arm: Arm, name: str, a: dict, ears=None):
         if ears is None:
             raise ValueError("you cannot hear: the ears are off")
         return lambda: dance(arm, ears, show)
+    if name == "look":
+        if eyes is None:
+            raise ValueError("you cannot see: the eyes are off")
+        return eyes.snap  # a picture: JPEG bytes
     if name == "wait":
         secs = number(a, "seconds", 0, 30)
         return lambda: pause(arm, secs)
@@ -223,29 +249,35 @@ class Body:
     """Owns the arm, in its own thread. Actions run in order; the first action of a newer reply (a new `gen`) drops
     what older replies left and stops the one in progress (but never a wake_up). With nothing to do it idles by
     itself (MOODS).
-    `report(text, wake)` (a note for the brain) and `idling(text)` (an idle move) are called from this thread."""
+    `report(text, wake, picture)` (a note for the brain, with a JPEG from `look`) and `idling(text)` (an idle move)
+    are called from this thread. `fb` is the arm's feedback after the last action: where the camera is, when still."""
 
     def __init__(self, arm: Arm, report, idling):
         self.arm, self.report, self.idling = arm, report, idling
-        self.ears = None  # for dance; set once the ears exist
+        self.ears = self.eyes = None  # for dance and look; set once they exist
+        self.fb = {}
+        self._where()
         self.todo, self.cv, self.gen, self.current = deque(), threading.Condition(), 0, None  # current: the label playing
         self.away = False  # the claw may be away from rest: idling starts by going home
         self.asleep = False  # after the sleep gesture it does not idle until the brain moves it
         self.since, self.mood, self.last = time.monotonic(), -1, None  # when the brain last moved it; idle state
         self.hushed = 0  # when someone last started talking
+        self.stopped, self.next, self.track_t = 0, 0, 0  # when the last action ended; the next fidget; no follow before
         threading.Thread(target=self._run, daemon=True).start()
 
     def hush(self) -> None:
-        """Someone started talking: like a pet, stop idling (gen None), perk up and lean forward, and hold off
-        idling for HUSH_S. Not while asleep or waking up, or while the brain's movements play; the brain's next
-        movement replaces it."""
+        """Someone started talking: like a pet, stop idling (gen None), turn to the face it last saw (or, if none
+        yet, perk up and lean forward), and hold off fidgets for HUSH_S (following a face goes on). Not while asleep
+        or waking up, or while the brain's movements play; the brain's next movement replaces it."""
         with self.cv:
             self.hushed = time.monotonic()
             if self.asleep or self._waking() or (self.gen is not None and (self.current or self.todo)):
                 return
             self._drop()
             self.gen, self.away = None, True  # away: idling starts again by going home
-            self.todo.append(("idle: listen", lambda: self.arm.perform(listen)))
+            face = self.eyes and self.eyes.nearest
+            keys = look_at(*face[3]) if face else listen
+            self.todo.append(("idle: listen", lambda: self.arm.perform(keys)))
             self.cv.notify()
             self.idling("listen")
 
@@ -290,60 +322,95 @@ class Body:
         while True:
             with self.cv:
                 while not self.todo:
-                    if not self.cv.wait(random.uniform(*IDLE_GAP_S)):
+                    if not self.cv.wait(TICK_S):
                         self._idle()
                 label, fn = self.todo.popleft()
                 self.current = label
             idle = label.startswith("idle: ")
+            picture = None
             try:
                 said = fn()
                 outcome, wake = f"done: {said}" if isinstance(said, str) else "done", False
+                if isinstance(said, bytes):  # look: the brain gets the picture, and a turn to react to it
+                    picture, outcome, wake = said, "done: the picture follows", True
             except Interrupted:
                 outcome, wake = "cut short", False
             except Exception as e:  # refused (ValueError) or failed (RuntimeError, serial): the brain hears at once
                 outcome, wake = f"failed: {e}", True
+            where = self._where()  # idle moves too, and before it counts as still: the eyes use it for where it looks
             with self.cv:  # abort is only ever set while something plays, so this leaves it clear for whatever comes next
                 self.current = None
                 self.arm.abort.clear()
+                self.stopped = time.monotonic()
+                self.next = self.stopped + random.uniform(*IDLE_GAP_S)
                 self.asleep = label.startswith(("gesture(sleep", "idle: sleep"))
                 if not idle:
                     self.since, self.mood = time.monotonic(), -1
                     self.away = not label.startswith(("go_home", "gesture(sleep", "gesture(wake_up"))
             if not idle:
-                self.report(f"{label} {outcome}{self._where()}", wake)
+                self.report(f"{label} {outcome}{where}", wake, picture)
             elif wake:  # a fidget that did not fit is just skipped
                 self.idling(f"{label[6:]} {outcome}")
 
     def _idle(self) -> None:
-        """Nothing to do for a while: fidget, picked at random from the mood the quiet has reached."""
-        mood = sum(time.monotonic() - self.since >= m[0] for m in MOODS) - 1
-        if self.asleep or mood < 0 or time.monotonic() - self.hushed < HUSH_S:
+        """Nothing to do (every TICK_S): follow the nearest face in view, and every IDLE_GAP_S fidget, picked at random
+        from the mood the quiet has reached."""
+        now = time.monotonic()
+        mood = sum(now - self.since >= m[0] for m in MOODS) - 1
+        if self.asleep or mood < 0:
             return
         if mood != self.mood:
             self.mood, secs = mood, MOODS[mood][0]
             if secs:
                 span = f"{secs:g} s" if secs < 60 else f"{secs / 60:g} minutes"
                 self.report(f"Nothing from your person for {span}: {MOODS[mood][1]}.", False)
-        what = "home" if self.away else random.choice([w for w in MOODS[mood][2] if w != self.last] or MOODS[mood][2])
-        self.away, self.last = False, what
+        face = self.eyes and self.eyes.nearest  # (when, degrees right, degrees up, look_at point)
+        in_view = face and face[0] > self.stopped and now - face[0] < 1  # seen since the arm last stopped
+        if in_view and max(abs(face[1]), abs(face[2])) > TRACK_DEG and now > self.track_t and self.fb:
+            here = self.fb["x"], self.fb["y"], self.fb["z"]
+            yaw0 = math.degrees(math.atan2(here[1], here[0]))
+            yaw = yaw0 + TRACK_GAIN * (math.degrees(math.atan2(face[3][1], face[3][0])) - yaw0)
+            goal = aim(self.arm.bounds, here, yaw, TRACK_GAIN * face[2])
+            if goal and math.dist(goal, here) > 10:  # not already as near as the box allows
+                self.gen, self.away = None, True
+                self.todo.append(("idle: follow", lambda: self._follow(goal)))
+                return self.idling(f"follow a face {face[1]:+.0f} deg right, {face[2]:+.0f} deg up: to "
+                                   f"({goal[0]:.0f}, {goal[1]:.0f}, {goal[2]:.0f})")
+        if now < self.next or now - self.hushed < HUSH_S:
+            return
+        self.next = now + random.uniform(*IDLE_GAP_S)
+        what = "home" if self.away and not in_view else random.choice(
+            [w for w in MOODS[mood][2] if w != self.last] or MOODS[mood][2])
+        if in_view and mood == 0 and what == "glance":  # watching someone: keep at it
+            return
+        self.away, self.last = self.away and what != "home", what
         if what == "home":
             fn = lambda: self.arm.go_to(*START, SETTLE_SPEED, GRIP_CLOSED)
         else:
-            if what == "glance":  # somewhere ahead, left or right, high or low. Wider turns from rest leave the box
-                a, r = math.radians(random.uniform(-30, 40)), random.uniform(400, 800)
+            if what == "glance":  # anywhere round, high or low (-30 to 40 degrees in the box drawn 2026-11-07)
+                a, r = math.radians(random.uniform(-150, 150)), random.uniform(400, 800)
                 keys = look_at(r * math.cos(a), r * math.sin(a), random.uniform(0, 400))
             else:
-                keys = look_at(*PERSON) if what == "look" else GESTURES[what][1]
+                keys = look_at(*(face[3] if face else PERSON)) if what == "look" else GESTURES[what][1]
             fn = lambda: self.arm.perform(keys)
         self.gen = None  # so the next reply's first movement replaces it
         self.todo.append((f"idle: {what}", fn))
         self.idling(what)
 
+    def _follow(self, point) -> None:
+        try:
+            self.arm.perform(follow(*point))
+        except ValueError:  # turned as far as the box allows: not again for a while
+            self.track_t = time.monotonic() + 5
+            raise
+        self.since = time.monotonic()  # someone moving in view: something is happening
+
     def _where(self) -> str:
         try:
-            x, y, z, _ = self.arm.read()
-            return f", claw at ({x:.0f}, {y:.0f}, {z:.0f})"
+            self.fb = self.arm._feedback()
+            return f", claw at ({self.fb['x']:.0f}, {self.fb['y']:.0f}, {self.fb['z']:.0f})"
         except Exception:
+            self.fb = {}  # still, but where the camera points is unknown
             return ""
 
 
@@ -352,17 +419,22 @@ class Brain:
         self.client, self.system, self.body = client, system, None
         self.history = []  # the conversation so far, as sent: only ever appended to
         self.results = []  # tool_result blocks owed for the last reply's tool calls, sent with the next message
-        self.heard, self.notes = [], []  # the person's messages and the program's notes, not sent yet
+        self.heard, self.notes, self.pictures = [], [], []  # the person's messages, the program's notes and
+        self.seen = ""  # pictures from `look`, not sent yet; what the camera saw, as last sent
+        self.glance = False  # a person said or did something: send a small picture of now with the next turn
         self.wake = asyncio.Queue()
         self.gen, self.task, self.t0, self.first = 0, None, 0, 0
 
     def hear(self, text: str) -> None:
         self.heard.append(text)
+        self.glance = True
         self.wake.put_nowait(None)
 
-    def note(self, text: str, wake=False) -> None:
+    def note(self, text: str, wake=False, picture: bytes | None = None) -> None:
         log("note", text=text)
         self.notes.append(text)
+        if picture:
+            self.pictures.append(picture)
         if wake:
             self.wake.put_nowait(None)
 
@@ -393,10 +465,22 @@ class Brain:
             return
         self.gen += 1
         texts = [{"type": "text", "text": t} for t in self.heard]
+        for p in self.pictures:
+            texts += [{"type": "text", "text": "(your camera, from your look:)"},
+                      {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                   "data": base64.b64encode(p).decode()}}]
+        glance = self.glance and not self.pictures and self.body.eyes and self.body.eyes.glance()
+        if glance:
+            texts += [{"type": "text", "text": "(your camera, now:)"},
+                      {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                   "data": base64.b64encode(glance).decode()}}]
         turn = [{"role": "user", "content": self.results + texts or [{"type": "text", "text": "(no message)"}]}]
-        if self.notes:
-            turn.append({"role": "system", "content": " ".join(self.notes)})
-        taken, did, owed, self.t0 = (len(self.heard), len(self.notes)), [], {}, time.monotonic()
+        seen = self.body.eyes.view() if self.body.eyes else ""
+        notes = self.notes + ([f"Your camera sees: {seen}"] if seen and seen != self.seen else [])
+        if notes:
+            turn.append({"role": "system", "content": " ".join(notes)})
+        taken, did, owed = (len(self.heard), len(self.notes), len(self.pictures)), [], {}
+        self.t0 = time.monotonic()
         try:
             async with self.client.messages.stream(
                     model=MODEL, max_tokens=16000, system=self.system, tools=TOOLS, messages=self.history + turn,
@@ -417,9 +501,13 @@ class Brain:
             if did:
                 self.note("Your last reply failed part way. Before that you had already: " + "; ".join(did) + ".")
             return
-        del self.heard[:taken[0]], self.notes[:taken[1]]
+        del self.heard[:taken[0]], self.notes[:taken[1]], self.pictures[:taken[2]]
+        self.glance = False
+        if seen != self.seen:
+            self.seen = seen
+            log("view", text=seen)
         log("reply", first_s=round(self.first - self.t0, 2) if did else None, secs=round(time.monotonic() - self.t0, 2),
-            stop=reply.stop_reason, model=reply.model, **{k: getattr(reply.usage, k) for k in (
+            stop=reply.stop_reason, model=reply.model, glance=bool(glance), **{k: getattr(reply.usage, k) for k in (
                 "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")})
         if reply.stop_reason == "refusal":  # nothing to send back; don't send the same thing again either
             self.note(f"Your reply to {[t['text'] for t in texts]} was declined by a safety check.")
@@ -448,7 +536,7 @@ class Brain:
                 self.done(did, "stopped moving", "arm> stop")
                 result = "stopped"
             else:
-                fn = body_action(self.body.arm, block.name, a, self.body.ears)
+                fn = body_action(self.body.arm, block.name, a, self.body.ears, self.body.eyes)
                 label = f"{block.name}({', '.join(f'{v:g}' if isinstance(v, (int, float)) else str(v) for v in a.values())})"
                 self.body.do(self.gen, label, fn)
                 self.done(did, f"queued {label}", f"arm> {label}")
@@ -507,6 +595,26 @@ def heard(brain: Brain, kind: str, **info) -> None:
         show(f"(ears failed: {info['error']}. Typing still works.)", dim=True)
 
 
+def saw(brain: Brain, kind: str, **info) -> None:
+    """What the eyes report (on the event loop): shown for debugging and logged. Someone arriving or a hand gesture
+    wakes the brain, but not asleep (only its name wakes it) or dancing (a reply would cut the dance off)."""
+    log("eyes", what=kind, **info)
+    body = brain.body
+    quiet = body.asleep or (body.current or "").startswith("dance")
+    if kind == "seen":
+        show(f"  (sees: {info['text']}{' Gesture: ' + info['gesture'] if info['gesture'] else ''})", dim=True)
+    elif kind == "arrived":
+        brain.glance = True
+        brain.note("Someone came into view of your camera.", wake=not quiet)
+    elif kind == "gesture":
+        brain.glance = True
+        brain.note(f"Someone in view is making a hand gesture at you: {info['gesture']}.", wake=not quiet)
+    elif kind == "ready":
+        show(f"(eyes on: {info['camera']})", dim=True)
+    elif kind == "error":
+        show(f"(eyes failed: {info['error']}. The rest still works.)", dim=True)
+
+
 def idling(what: str) -> None:
     show(f"  (idle: {what})", dim=True)
     log("idle", what=what)
@@ -528,11 +636,13 @@ async def main() -> None:
     loop = asyncio.get_running_loop()
     print("Connecting. The arm resets and moves to its resting pose: keep clear...")
     arm = await asyncio.to_thread(Arm, state["bounds"])
-    brain.body = Body(arm, lambda text, wake: loop.call_soon_threadsafe(brain.note, text, wake),
+    brain.body = Body(arm, lambda text, wake, picture=None: loop.call_soon_threadsafe(brain.note, text, wake, picture),
                       lambda what: loop.call_soon_threadsafe(idling, what))
     ears = Ears(lambda kind, **info: loop.call_soon_threadsafe(lambda: heard(brain, kind, **info)),  # ready in ~3 s
                 lambda: brain.body.asleep)
     brain.body.ears = ears
+    brain.body.eyes = Eyes(lambda kind, **info: loop.call_soon_threadsafe(lambda: saw(brain, kind, **info)),
+                           lambda: brain.body.fb if brain.body.current is None and not brain.body.todo else None)
     brain.note("You have just been switched on, at your resting pose.", wake=True)
     print(f"Talk to it (or type). Ctrl-C (or Ctrl-D) stops the arm and quits. Log: {RUN}/")
     with patch_stdout(raw=True):

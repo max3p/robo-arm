@@ -4,10 +4,16 @@ A Waveshare RoArm-M2-S desk robot arm that acts like a clever pet dog. You talk 
 reacts, and it answers only with body language: nods, head tilts, a play bow, leaning in, the claw and its light.
 
 - **Listens all the time:** speech is turned into text locally on the GPU (faster-whisper). Nothing is recorded.
+- **Sees through a camera on its head:** a small vision model on the GPU (Qwen3-VL-2B) puts what the camera sees
+  into a sentence or two, and a face detector adds where faces are and how far. Claude gets those words whenever they
+  change, and a small picture with whatever you say or do. Someone coming into view or making a hand gesture (a thumbs
+  up, a wave) gets its attention. When it needs more detail, Claude can ask for a sharper picture (`look`). No picture
+  is saved.
 - **Moves while it thinks:** each movement starts as soon as Claude has written it, and speaking cuts off a reply
   in progress.
-- **Has a life of its own:** between conversations it glances around, gets bored, then sleepy, and falls asleep.
-  This runs locally, with no API calls.
+- **Has a life of its own:** between conversations it watches. It keeps its camera on the nearest face, turns to
+  whoever starts talking, and looks around when no one is in view. When nothing happens it gets bored, then sleepy,
+  and falls asleep. This runs locally, with no API calls.
 - **Asleep, it ignores everything except its name:** "Robert" or "Rob" wakes it.
 - **Dances to music:** "Rob, dance to this song!" makes it listen for 3 s, then bob to the beat for 30 s, the whole
   arm bouncing with the claw level. It keeps listening as it dances and settles on the tempo it hears most, bobbing
@@ -20,7 +26,10 @@ The full design notes, decisions and test results are in [project-v2.md](project
 ## What you need
 
 - A Waveshare RoArm-M2-S on USB (`/dev/ttyUSB0`) with its 12 V supply. Your user must be in the `dialout` group.
-- Linux with an NVIDIA GPU (CUDA 12) for speech to text. The first run downloads the Whisper model (~1.6 GB).
+- Linux with an NVIDIA GPU with 8 GB for speech to text and vision (both together use about 6.5 GB). The first run
+  downloads the Whisper model (~1.6 GB), the vision model (~4.5 GB) and the face detector (230 KB).
+- A USB camera on the arm, above the claw. It is found by its name, "USB Camera"; change `CAMERA` at the top of
+  [eyes.py](eyes.py).
 - A microphone. It is set up for a Blue Snowball; change `MIC` at the top of [ears.py](ears.py).
 - PortAudio from your system packages (Fedora: `portaudio`).
 - A Claude API key.
@@ -48,8 +57,8 @@ use. The bounds are saved to `arm_state.json`.
 - **Only one program can use the arm at a time.** If Claude Code has the MCP server connected, disconnect it first.
 - **What appears in the terminal is for debugging only.** The arm can't talk, so the screen shows what it heard
   and what it did.
-- **Every run is logged** to `logs/<start time>/transcript.jsonl`. This holds what it heard, what it did, its moods
-  and each reply's timing and token use.
+- **Every run is logged** to `logs/<start time>/transcript.jsonl`. This holds what it heard, what it saw (as words),
+  what it did, its moods and each reply's timing and token use.
 
 ## Files
 
@@ -57,6 +66,7 @@ use. The bounds are saved to `arm_state.json`.
 |---|---|
 | [arm.py](arm.py) | The pet. The brain (Claude, streaming tool calls) and the body thread (actions, idling, moods, sleep). Settings at the top: `MODEL`, `MOODS`, `NAME`, `PERSON` |
 | [ears.py](ears.py) | Speech in. The mic, a voice detector and Whisper on the GPU |
+| [eyes.py](eyes.py) | Sight in. The camera, a face detector, and a small vision model on the GPU that describes the scene |
 | [dance.py](dance.py) | Dancing: finds the beat in what the mic hears and bobs the arm to it |
 | [gestures.py](gestures.py) | Body language as keyframes: nod, shake, happy, lean_in, sleep, wake_up, look_at and more |
 | [motion.py](motion.py) | Safe motion on the arm: straight-line moves, sag correction, gestures, stopping within 20 ms. All limits are checked here |
@@ -70,18 +80,17 @@ use. The bounds are saved to `arm_state.json`.
 claude mcp add robo-arm -- $PWD/.venv/bin/python $PWD/mcp_server.py
 ```
 
-Claude then gets tools to move the arm, play gestures, look at points and play taught paths. It's limited to the
-same box.
+Claude then gets tools to move the arm, play gestures, look at points, play taught paths and take a picture with
+the camera (`look`). It's limited to the same box.
 
 ## Safety
 
 - **The box is enforced in code, never only in a prompt.** Moves outside it are refused before anything moves.
   So are moves out of reach and paths that pass too close to the base.
 - **The box limits the claw tip only, not the elbow or forearm,** so draw it smaller than the real free space.
+- **The base turns at most 165° either way, and never across directly behind it,** so it can't wind its wires
+  round. A move that would pass behind goes round the front.
 - **Speed is capped** at 500 mm/s.
 - **Ctrl-C stops the arm without asking the LLM.** The arm holds where it is.
 - **The power switch is the real emergency stop.**
 
-## Next
-
-Phase 3 adds a camera on the arm, so Robert can see the room and its person.

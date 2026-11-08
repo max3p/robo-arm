@@ -28,7 +28,7 @@ from collections import deque
 import numpy as np
 
 from ears import FRAME, RATE
-from motion import GRIP_CLOSED, MAX_SPEED, check_target
+from motion import FOREARM_MM, GRIP_CLOSED, MAX_SPEED, UPPER_ARM_MM, check_target
 
 FIRST_S, DANCE_S, WINDOW_S, RESYNC_S = 3, 30, 6, 0.5  # s
 GUESSES = 12            # the last this many guesses (6 s of them) vote on the tempo
@@ -38,7 +38,6 @@ FULL = 0.15             # confidence (the agreeing guesses' strength, times how 
 MIN_DEPTH = 0.3         # which it bobs at full depth; below it shallower, down to MIN_DEPTH of it
 BPM = (60, 180)         # tempos it looks for. Prefers ones near 120: a beat at 70 could also be counted at 140
 FAST_BPM = 140          # faster than this, it bobs on every other beat
-UPPER_ARM_MM, FOREARM_MM = 238.9, 279.9  # fitted to the arm's joint readings at 8 poses (2026-11-08): 0.14 mm rms
 TOP_DEG, LOW_DEG = -16, -57  # the upper arm, from vertical (+ forward), at the person's high (214, 230) and low (79, 122)
 SWAY_DEG = 8            # the base turns this far each way across a bar
 RAMP_S = 2              # it eases into the dance and out of it over this long, so it starts and ends still

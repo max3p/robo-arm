@@ -49,6 +49,9 @@ SAG_MIN_MM, SAG_MAX_MM = 3, 25
 # servo goal), so go_to refuses them first. Targets are measured from the shoulder pivot (the x, y, z origin); the arm's
 # two links are ~239 and ~280 mm, so it reaches 41..519 mm. These limits keep well inside that. Derived from firmware constants.
 REACH_MIN_MM, REACH_MAX_MM = 100, 480
+UPPER_ARM_MM, FOREARM_MM = 238.9, 279.9  # fitted to the arm's joint readings at 8 poses (2026-11-08): 0.14 mm rms
+BEHIND_DEG = 165  # the base turns at most this far either way. Directly behind (x < 0, y = 0) the firmware's base angle
+# jumps from +180 to -180, so a move across it would spin the base the long way round, tangling its wires
 BASE_KEEPOUT_MM = 100  # the claw must stay this far (in x, y) from the base's vertical axis: nearer is a folded arm that may hit itself
 XYZ_SERVO_SPEED_DEG = 360  # deg/s servo speed limit set before xyz moves: headroom above MAX_SPEED, not a target speed
 XYZ_SERVO_ACC_DEG = 20    # servo acceleration limit for xyz moves; 20 lags the stream least at speed (2 lagged ~25% more)
@@ -70,7 +73,9 @@ def describe_limits(bounds: dict) -> str:
     return (f"Hard limits (mm; origin at the shoulder pivot; x forward, y left, z up): "
             + ", ".join(f"{a} {lo:g} to {hi:g}" for a, (lo, hi) in bounds.items())
             + f". The claw must also stay {REACH_MIN_MM}-{REACH_MAX_MM} mm from the origin, and a straight path may not"
-            f" pass within {BASE_KEEPOUT_MM} mm of the base's vertical axis (x=y=0). Targets outside are refused before"
+            f" pass within {BASE_KEEPOUT_MM} mm of the base's vertical axis (x=y=0). The base turns at most {BEHIND_DEG}"
+            f" degrees either way from straight ahead (x forward), and no move may cross directly behind it. Targets"
+            f" outside are refused before"
             f" the arm moves. Speed (peak, mm/s) is {MIN_SPEED}-{MAX_SPEED}, default {DEFAULT_SPEED}; moves are smooth"
             " and eased at both ends.")
 
@@ -100,6 +105,9 @@ def check_target(bounds: dict, x, y, z) -> None:
         lo, hi = bounds[axis]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:  # also rejects NaN
             raise ValueError(f"{axis} must be a number in [{lo:g}, {hi:g}], got {round(v, 1) if isinstance(v, float) else v!r}")
+    if math.hypot(x, y) > 1 and abs(math.degrees(math.atan2(y, x))) > BEHIND_DEG:
+        raise ValueError(f"({x:g}, {y:g}, {z:g}) is {abs(math.degrees(math.atan2(y, x))):.0f} degrees round from straight "
+                         f"ahead: the base turns at most {BEHIND_DEG} either way (its wires)")
     if not REACH_MIN_MM <= math.dist((0, 0, 0), (x, y, z)) <= REACH_MAX_MM:
         raise ValueError(f"({x:g}, {y:g}, {z:g}) is outside the arm's safe reach "
                          f"({REACH_MIN_MM}-{REACH_MAX_MM} mm from the shoulder pivot)")
@@ -257,10 +265,12 @@ class Arm:
         self.commanded = tuple(aim)
         return now
 
-    def go_to(self, x: float, y: float, z: float, speed: float = DEFAULT_SPEED, t: float | None = None):
+    def go_to(self, x: float, y: float, z: float, speed: float = DEFAULT_SPEED, t: float | None = None, _turned=False):
         """Move the claw to (x, y, z) mm in a straight line at `speed` mm/s (peak), and the gripper to angle t (None = keep
-        it). Returns the measured final (x, y, z). Raises ValueError, before anything moves, if the target is outside the
-        bounds or reach or the path passes too near the base; RuntimeError if the arm does not get there."""
+        it). If the line would pass too near the base or cross behind it, the base first turns to face the target
+        (round the front, at the nearer of the two reaches, so the claw stays in the box). Returns the measured final (x, y, z). Raises ValueError, before
+        anything moves, if the target is outside the bounds or reach, or the path passes too near the base from a
+        start inside the keep-out; RuntimeError if the arm does not get there."""
         if not self.bounds:
             raise RuntimeError("no bounds: draw them first with cli.py")
         check_target(self.bounds, x, y, z)
@@ -273,9 +283,19 @@ class Arm:
             d = [g - a for a, g in zip(start[:2], goal[:2])]  # closest approach of the straight path to the base axis, in plan view
             f = min(max(-sum(a * v for a, v in zip(start, d)) / (sum(v * v for v in d) or 1), 0), 1)
             closest = math.hypot(*(a + f * v for a, v in zip(start, d)))
-            if closest < BASE_KEEPOUT_MM and closest < math.hypot(*start[:2]) - 0.5:  # moving away from the base is always allowed
-                raise ValueError(f"the straight path to ({x:g}, {y:g}, {z:g}) passes {closest:.0f} mm from the base axis "
-                                 f"(keep-out {BASE_KEEPOUT_MM} mm); choose a target that avoids it")
+            near = closest < BASE_KEEPOUT_MM and closest < math.hypot(*start[:2]) - 0.5  # moving away is always allowed
+            # both ends are within BEHIND_DEG, and along a straight line the angle sweeps one way only: only crossing
+            # behind can leave that range
+            behind = start[1] * y < 0 and start[0] + (x - start[0]) * start[1] / (start[1] - y) < 0
+            if near or behind:
+                r0 = math.hypot(*start[:2])
+                if _turned or min(r0, math.hypot(x, y)) < BASE_KEEPOUT_MM:
+                    raise ValueError(f"the straight path to ({x:g}, {y:g}, {z:g}) passes {closest:.0f} mm from the base "
+                                     f"axis (keep-out {BASE_KEEPOUT_MM} mm) or behind it; choose a target that avoids it")
+                da = math.degrees(math.atan2(y, x) - math.atan2(start[1], start[0]))  # never across behind: round the front
+                dr = max(min(r0, math.hypot(x, y)), BASE_KEEPOUT_MM + 10) - r0
+                self.perform([(abs(dr) / 150, dr, 0, 0, None, None), (abs(da) / 60, dr, da, 0, None, None)])
+                return self.go_to(x, y, z, speed, t, True)
             self._xyz_mode(fb)
             t = fb["t"] if t is None else t
             self._glide((*start, fb["t"]), (*goal, t), max(math.dist(start, goal) * 1.5 / speed, 0.2),
@@ -340,7 +360,8 @@ class Arm:
                 keys, size, slides = keys(ref, self.bounds), 1.0, (0,)  # aimed gestures go where they are aimed
             opening = min(max((GRIP_CLOSED - fb["t"]) / (GRIP_CLOSED - GRIP_OPEN), 0), 1)
             start = (math.hypot(*ref[:2]), math.degrees(math.atan2(ref[1], ref[0])), ref[2], opening, self.led_level)
-            mid = (sum(self.bounds["x"]) / 2 - start[0], sum(self.bounds["z"]) / 2 - start[2])
+            mid = ((max(self.bounds["x"][0], BASE_KEEPOUT_MM) + self.bounds["x"][1]) / 2 - start[0],  # the box ahead:
+                   sum(self.bounds["z"]) / 2 - start[2])  # one reaching behind the base would slide it onto the base
             error = None
             for k, f in ((k, f) for k in (1, 0.7, 0.5, 0.35) for f in slides):
                 try:

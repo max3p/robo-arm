@@ -28,6 +28,8 @@ START_P, END_P = 0.5, 0.35  # the detector's speech probability: speech starts a
 SILENCE_S = 0.5     # this much quiet ends an utterance
 PREROLL_S = 0.3     # kept from before the start, so the first syllable isn't clipped
 MIN_SPEECH_S = 0.3  # less speech than this (a clunk, a cough) is dropped, with its text (arm.py wakes on a name in it)
+SURE_LOGPROB = -0.4  # ... unless Whisper is this sure of it: short commands it got right scored -0.08 to -0.36 ("Let
+# go.", "Hey.", "further.", "Go to sleep."), the noise dropped as too short -0.43 to -0.85 ("Hmm.", "Amen.") (2026-11-08)
 MAX_SPEECH_S = 15   # longer speech is cut here, so the brain isn't kept waiting
 HOTWORDS = "Robert, Rob"  # the arm's name (arm.NAME), hinted to Whisper while it sleeps: 95% of short synthetic names
 # were caught with the hint, 74% without. Only then: it also turned 14% of single words ("Rub it.", "Robot.") into "Rob"
@@ -121,7 +123,7 @@ class Ears:
                  "logprob": round(min((s.avg_logprob for s in segments), default=0), 2)}
         if not text:
             self.report("dropped", why="no words", **info)
-        elif voiced_s < MIN_SPEECH_S:  # transcribed all the same: asleep, a quick "Rob!" (0.13-0.29 s) must wake it
+        elif voiced_s < MIN_SPEECH_S and info["logprob"] < SURE_LOGPROB:  # transcribed all the same: asleep, a quick "Rob!" (0.13-0.29 s) must wake it
             self.report("dropped", why="too short", **info)
         elif info["logprob"] < MIN_LOGPROB:
             self.report("dropped", why="unsure, likely made up", **info)

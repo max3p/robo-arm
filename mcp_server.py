@@ -15,11 +15,12 @@ import sys
 import time
 from typing import Literal
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from motion import (BASE_KEEPOUT_MM, DEFAULT_SPEED, START, MAX_SPEED, MIN_SPEED, GRIP_CLOSED, GRIP_OPEN, REACH_MAX_MM,
                  REACH_MIN_MM, TOLERANCE_MM, Arm, describe_limits, load_state)
+from eyes import snapshot
 from gestures import GESTURES, look_at as look_keys
 
 
@@ -73,6 +74,8 @@ def tool(description: str):
 
 
 def pose_or_unknown():
+    if _arm is None:  # not opened yet (a failed look): opening it just for this would reset the arm
+        return "unknown"
     try:
         return pose()
     except Exception:
@@ -159,6 +162,12 @@ def play(name: str, speed: float = DEFAULT_SPEED) -> dict:
         raise ValueError(f"no movement '{name}'; saved: {', '.join(PATHS) or 'none'}")
     arm().play(PATHS[name], speed)
     return pose()
+
+
+@tool("A picture from the camera on the arm's head, just above the claw, looking wherever the claw faces. It does not "
+      "move the arm; turn it first (look_at, move_to) to see somewhere else.")
+def look() -> Image:
+    return Image(data=snapshot(), format="jpeg")
 
 
 if __name__ == "__main__":

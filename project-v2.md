@@ -17,7 +17,9 @@ An LLM controls a desk robot arm through tool calls. The tools act in the physic
      content, then bored, then sleepy, then asleep.
    - **Phase 2.8 (built, 2026-11-07):** its name is Robert. Asleep, it ignores everything said except "Robert" or
      "Rob", which wakes it.
-3. **Phase 3 (later):** a camera on the arm and a perception worker that feeds scene information back to the LLM.
+3. **Phase 3 (built, 2026-11-08):** sight. `eyes.py` reads the USB camera above the claw: a face detector on the
+   CPU and a small vision model on the GPU turn what it sees into words for the brain. A small picture goes with what
+   a person says or does, and the brain can ask for a bigger one (`look`).
 
 ## Quick start
 
@@ -97,8 +99,8 @@ in control:
 | File | Role |
 |---|---|
 | `motion.py` | Motion API: `Arm.go_to` (straight-line, safety-checked, sag-corrected), `gripper`, `play(points)`, `led`, `read`, `free`, `lock`; `perform(keys, size)` plays a gesture (see below); `abort` (a `threading.Event`: set from any thread, the move in progress holds the claw where it is and raises `Interrupted` within 20 ms); `check_target`; `describe_limits`; `load_state`/`save_state`; all tuned constants with the measurements behind them. **Never prints or prompts**: stdout carries the MCP protocol |
-| `arm.py` | The pet chat (Phase 2.5): prompt, brain loop, body thread, the tools and the system prompt. Knobs at the top: `MODEL`, `EFFORT`, `IDLE_GAP_S`, `HUSH_S`, `MOODS` (idle, Phase 2.7), `PERSON` |
-| `ears.py` | Speech in (Phase 2.6): mic thread, Silero voice detector, faster-whisper on the GPU. Knobs at the top: `MIC`, `STT_MODEL`, `SILENCE_S`, `MIN_SPEECH_S`, `MIN_LOGPROB` |
+| `arm.py` | The pet chat (Phase 2.5): prompt, brain loop, body thread, the tools and the system prompt. Knobs at the top: `MODEL`, `EFFORT`, `IDLE_GAP_S`, `TICK_S`, `TRACK_DEG`, `HUSH_S`, `MOODS` (idle, Phase 2.7), `PERSON` |
+| `ears.py` | Speech in (Phase 2.6): mic thread, Silero voice detector, faster-whisper on the GPU. Knobs at the top: `MIC`, `STT_MODEL`, `SILENCE_S`, `MIN_SPEECH_S`, `SURE_LOGPROB`, `MIN_LOGPROB` |
 | `cli.py` | Human REPL. Commands: `read`, `move`, `grip` (radians), `home`, `led`, `bounds` (free the arm and sweep the claw; samples every 100 ms; the min/max becomes the box), `trace` (show the 6 faces of the box), `record NAME` (Enter per point, q to save; one point = a pose), `play NAME`, `gesture NAME [size]`, `look x y z`, `paths`, `delete NAME`. Ctrl-C stops motion |
 | `gestures.py` | The gestures as data: keyframes `K(secs, dr, da, dz, grip, led)` relative to the current pose (dr out from the base axis, da degrees of base turn, dz up), plus functions for the aimed ones (`sleep`, `wake_up`, `look_at`) |
 | `mcp_server.py` | AI tools (see below). The bounds are frozen at startup and the port opens lazily on the first tool call. `ValueError`/`RuntimeError` become `ToolError`, so the model sees the real reason plus the current pose |
@@ -118,6 +120,7 @@ in control:
 | `play(name, speed=300)` | Replays a hand-taught path from `arm_state.json` |
 | `gesture(name, size=1)` | Body language, by name (an enum in the schema; the description says what each means). Relative ones play wherever the claw is and end where they started; `size` 0.2-1.5. If one does not fit it first slides toward the middle of the box, then shrinks (down to 0.35x); the result gives `size_used` and `slid_mm` |
 | `look_at(x, y, z)` | Turns the base to face a point and moves half way to its height, then a small perk. Stays facing it; turns part way if the full turn does not fit |
+| `look()` | A picture (JPEG, 800x450) from the camera above the claw. Opens the camera for that picture only, and never opens the arm |
 
 The bounds reach the model before it acts in three ways: in the server instructions, in every motion tool's description, and from `workspace()`.
 
@@ -430,7 +433,7 @@ Between inputs the arm used to sit still. Now the body thread idles by itself wh
 
 | Quiet for (since the brain last moved it) | Mood | Fidgets, picked at random 2-5 s apart (`IDLE_GAP_S`) |
 |---|---|---|
-| 0 s | content | first back to rest, then glance around, tilt, calm |
+| 0 s | curious (since Phase 3.1) | glance around, look at the person, tilt, curious; watching a face, no glancing away |
 | 30 s | bored | glance, look at the person, beg, curious, play_bow, back to rest (no yawn: too many, said the user) |
 | 2 min | sleepy | yawn, calm, glance, back to rest |
 | 4 min | asleep | the `sleep` gesture, then nothing until the brain moves it |
@@ -447,8 +450,9 @@ static, 2026-11-07.)
 2. **The brain always wins.** Idle moves are queued like a cut-off reply (`gen = None`), so the first movement of any
    reply stops them. Only the brain's own movements reset the quiet clock: if it decides speech isn't for it (the
    TV), the boredom carries on.
-3. **Someone starting to talk** (the ears' `speech` event) stops an idle move at once. The arm perks up where it
-   faces, without turning (the user's call): `gestures.listen` leans out to 50 mm past the resting pose (less near
+3. **Someone starting to talk** (the ears' `speech` event) stops an idle move at once. Since Phase 3.1 it turns to
+   the face it last saw (`look_at` its point). Before that, and still when it has seen no face, it perks up where it
+   faces, without turning (the user's call then): `gestures.listen` leans out to 50 mm past the resting pose (less near
    the box edge) and lifts to near the top of the box, and holds there. It is a set distance, not a lean from
    wherever the claw is: at first it leaned 50 mm further each time, and in a run of questions (one perk per
    question, no time to go home between) the claw walked out 162, 213, 263, 312 mm. Now it holds 211 mm, and a claw
@@ -590,18 +594,153 @@ can look confused. There is no way to stop it early except typing (a new reply) 
     - 5 s of talking and then music: it started at a wrong 97 BPM, and was on the beat within 4 bobs.
     - Speech only: it bobbed 10-18 mm, wandering.
 
-## Phase 3: camera and perception (do not build yet)
+## Phase 3: sight, `eyes.py` (built 2026-11-08)
 
-- A camera mounted on the arm. A perception worker (a thread or process) owns the camera, runs open-vocabulary detectors
-  (YOLO-World, OWL-ViT, Grounding DINO), keeps the latest scene and emits debounced events.
-- Tool results gain an observation package: an optional downscaled image, plus a JSON scene of entities with labels and world positions in mm.
-- Depth comes from a table-plane assumption first (cheapest), via a one-time hand-eye calibration that uses the T:105 pose.
-- The tool interface stays stable: Phase 3 only enriches results and adds a `look()` tool.
+The camera ("USB Camera", `/dev/video2`; the "PA552" is a separate webcam) sits on the arm just above the claw and
+looks wherever the claw faces. Raw pictures cost tokens and context, so by default the brain gets words:
+
+```
+camera 1280x720 MJPG ~30 fps -> YuNet face detector (OpenCV, CPU, ~10 ms at 640x360), every frame
+        -> faces: angle from the camera's axis, distance from their size, and a look_at point in arm coordinates
+     -> when the arm is still and the picture changed: Qwen3-VL-2B-Instruct (transformers, fp16, GPU, ~4 GB, 1.5-3.5 s)
+        -> {"people": n, "scene": "<a sentence or two>", "gesture": "<thumbs up, wave, ... or none>"}
+```
+
+- **What the brain gets.** With each reply, if it changed since the last one sent: `Your camera sees: <scene>
+  Faces: a face 12 deg left, 5 deg up from straight ahead, about 0.8 m away (15% of the picture wide): look_at
+  (850, 170, 290) faces it.` Parts seen before the arm last moved are marked so. The look_at point is in arm
+  coordinates, so it stays right after the arm moves. That is about 60-120 tokens, and nothing is sent when nothing
+  changed.
+- **The glance.** A turn that a person caused (something heard or typed, someone arriving, a gesture) also carries
+  the latest frame at 448x252, about 170-190 tokens. Only turns that happen anyway carry it: in the first session with
+  the user (2026-11-08, 4 min) that would have been about 20 turns, ~4k tokens. Waking the brain with a picture every
+  2 s instead was rejected. The conversation is append-only, so it would grow about 9k tokens a minute, pass Haiku's
+  100K price step in ~11 minutes and fill the 1M context in under two hours. That is roughly $10-25 an hour, against
+  under a cent for that session, and a pet that reacts every 2 s. A turn that has a `look` picture skips the glance.
+- **What wakes the brain.** A face after none for 20 s ("Someone came into view"), and a new hand gesture. Neither
+  wakes it while it is asleep (only its name does) or dancing (a reply would cut the dance off).
+- **`look`** is a body action, so it is taken after the movements queued before it, 0.5 s after the arm stops. The
+  JPEG (800x450, ~600 tokens) goes to the brain with its next message, and the brain is woken to react. The MCP server
+  has a `look()` too, which opens the camera just for that picture.
+- **When it describes.** Only while the arm is still (the body is playing nothing, plus 0.5 s), and only when the
+  picture changed: over 2% of a 64x36 grey thumbnail changed by more than 30 levels, or the number of faces changed.
+  It checks once a second. A still, empty room is described once and then left alone. Idle glances do make it
+  describe again after each move, which costs GPU time but no tokens.
+- **Why two models.** The vision model words scenes well. On test photos it got a thumbs-up (two of them), a wave, a
+  person stretching and a woman at a desk all right. But its boxes were poor: it gave the woman at the desk the whole
+  picture. YuNet's face boxes are reliable and arrive every frame, so the geometry, the "arrived" event and the
+  look_at point come from YuNet. At a score of 0.8 it drops the false hits seen on test photos: a face in a picture
+  on the wall (0.75), a tulip (0.64) and a sweater (0.66).
+- **The prompt.** "Who and what is in view, what any person is doing" made it describe "a man leaning over a desk" at
+  the user's empty chair. Asking for the number of people first ("often 0") fixed that, on both empty-room frames and
+  all the test photos. Saying it was a robot pet's camera made it put "a small robot pet" in the scene.
+- **Calibration on the arm** (2026-11-08, with phase correlation between frames):
+  - Turning the base 10° shifts the picture 143 px, and 8.7° shifts it 129 px. So the focal length is about
+    825 px at 1280 wide, about 76° across. The picture is not mirrored: turning left moves the scene right.
+  - The camera tilts with the forearm. The forearm is level when shoulder + elbow is about 90° (88.3° at rest). A
+    17.8° change shifted the picture 265 px, as the focal length predicts.
+  - Its tilt relative to the forearm (`TILT_DEG`) was not measured, and it looks level by eye.
+  - Distance assumes a face 150 mm wide, so it is good to about ±20%. Where the camera is: the claw, turned like the base
+    (`b`) and tilted like the forearm (`90° - s - e`), from the feedback read after each action.
+- **GPU.** Whisper and the vision model together peak at about 7.2 GB of the 3060 Ti's 8 GB, with the desktop's own
+  0.7 GB. Sharing the card made no difference to transcription: 0.21 s alone, 0.23 s while the model was describing.
+  torch 2.15 brings CUDA 13 libraries; Whisper's ctranslate2 still loads its CUDA 12 ones in the same process.
+- **Tested** (2026-11-08, with the person away):
+  - Live, the empty room was described correctly, then nothing more while it stayed the same.
+  - End to end on the real arm, asked "turn a little to your right and have a look", Claude did look_at(400, -300,
+    150), then look, got the picture and reacted curious.
+  - Asked "is there anyone sitting in my chair?", it shook its head.
+  - A faked thumbs-up event woke it, and it played happy within 1 s.
+  - Not yet tested with a real person: whether faces are found at the user's distance, how good the distances and
+    look_at points are, and whether gestures are caught live.
+  - A face photo on the monitor was no stand-in for a person: the monitor stands about 60° off the camera's axis,
+    so the face was too foreshortened for YuNet.
+- **First session with the user** (2026-11-08, 4 min, `logs/2026-11-08_16-03-41`):
+  - Faces read 0.5-1.0 m away. "Can you look at me?" turned it to the face's look_at point. When a screwdriver
+    mattered, it called `look` by itself.
+  - Gesture wakes were noisy: of 11, one was a thumbs-up. The rest were "pointing" 6 times, "thinking", "smiling",
+    "hands on hips", and a whole sentence. Each woke the brain, which then acted on it. Not fixed yet: a fixed list of
+    gestures, seen twice in a row, would do it.
+  - Hearing felt weaker. With the vision model generating non-stop the mic lost no audio and the detector fell no
+    further behind (0 overflows, under 1 ms lag), so it was not the GPU or the GIL. It was `MIN_SPEECH_S`: four real
+    commands ("Let go.", "Hey.", "further.", "Go to sleep.") were dropped as too short, though Whisper scored them
+    -0.08 to -0.36. Earlier too-short noise scored -0.43 to -0.85, so short speech is now kept at `SURE_LOGPROB`
+    (-0.4) or better. That line rests on seven examples.
+- **Privacy.** Frames stay in memory. Only the words go to the log (`eyes` and `view` lines), and pictures go only to
+  Claude: the glance with a person's turn, and `look`.
+- **Ideas for later.** A gesture recognizer that runs every frame (faster than the 2-4 s it takes now), recognizing
+  its person, and object positions in mm for grasping (the old plan: open-vocabulary detectors and a table-plane
+  depth from a hand-eye calibration).
+
+## Phase 3.1: watching people (built 2026-11-08)
+
+The user asked for it to be curious by default instead of resting, and to take a special interest in people: look at
+whoever talks, and keep the camera on their face as they move. It should get bored only when nothing is happening.
+All of it is in the body thread, so it makes no API calls.
+
+- **Following.** The eyes keep `nearest`: the biggest face seen with the arm still, with its angle off the camera's
+  axis (right and up) and its look_at point. Every `TICK_S` (0.25 s) the idle body checks it. If that face was seen
+  since the arm last stopped and is over `TRACK_DEG` (8°) off the axis either way, it moves `TRACK_GAIN` (70%) of the
+  way toward facing it. That is a smooth `gestures.follow` move at up to ~50°/s, without the perk. Each step needs
+  a new sharp frame (0.5 s after stopping), so it follows in steps about 1-2 s apart. If the box stops the move, it
+  does not try again for 5 s.
+- **Tilting.** The arm has no wrist, so the camera's tilt is the forearm's, and where the claw is sets it.
+  `gestures.pitch` gives it from the fitted links (238.9 and 279.9 mm, elbow up). On the real arm it matched the
+  measured `90° - s - e` within 0.7° at five poses. `gestures.aim` finds the claw position in the box nearest where
+  it is, with the turn and tilt asked for. If that position isn't allowed, it gives up the tilt a degree at a time,
+  then the turn in quarters. Tilting up means pulling the claw in and up. In the box drawn on 2026-11-07 (top at
+  231 mm) that is only about 10° up, at (118, 0, 228), and down to about -99°. With the top at 300 mm it would be
+  about 22° up, with 400 mm about 40°. The user stood up and was lost before tilting was added.
+- **The bigger box** (drawn 2026-11-08 16:35: x -509.5 to 494.5, y -180.2 to 492.5, z -113.4 to 511.2). Code had
+  assumed a box ahead of the base with its top near rest height, so it needed these fixes:
+  - A gesture that doesn't fit slides toward the middle of the box. The x range now runs behind the base, so its
+    middle (-7.5) was next to the base. It now slides to the middle of the part ahead of the keep-out.
+  - `wake_up` stretched to the top of the box, now out of reach, so it shrank to 0.35x. It now stretches up to 330 mm
+    (45°, the arm nearly straight).
+  - `listen` lifted to near the top of the box: now 10 mm above rest, as before.
+  - `aim` could pick a place inside the 100 mm keep-out around the base. It no longer does.
+  - All gestures now fit at full size (some after sliding) from rest, from (300, 150, 300) and from (120, 0, 400).
+- **How far up.** Measured on the arm: 54.8° up, at (114, 0, 462), reached in three follow steps. It cannot look
+  straight up, whatever the box. The firmware poses the arm elbow up, so the forearm is never steeper than the upper
+  arm. The 480 mm reach limit keeps the two links at least 45° apart. And the claw must stay 100 mm off the base
+  axis. Together those cap the forearm, and the camera, at about 55°. Without the reach limit it would be about 65°.
+  With half the picture's height above its centre (23.6°), it sees up to about 78° above level.
+- **Turning round** (the user: up to 180°, never a full turn: the wires tangle). Directly behind the base
+  (x < 0, y = 0) the firmware's base angle jumps from +180° to -180°. A move across that line would spin the base
+  the long way round. So:
+  - `check_target` refuses anything more than `BEHIND_DEG` (165°) round from straight ahead. That is checked for
+    every target, gesture sample and streamed dance point. A sag correction (25 mm at most) can't push a target
+    from within 165° across 180°, since the claw is at least 100 mm from the axis.
+  - `go_to` refuses a straight line across behind. When the line passes behind or through the keep-out, it first
+    turns round the front, at the nearer of the two reaches, then moves straight. Before this, the brain's
+    `go_home` and idling's home failed from behind, which would have left it stuck there.
+  - `turn_to` keeps a turn aimed into the 30° wedge at its edge, on the target's side. If the arm is already turned
+    round it stays on the side it is on, so someone walking past behind it doesn't make it whip round the front.
+  - Glances now go anywhere from -150° to 150° (they were -30° to 40°, to fit the old box).
+  - Tested on the arm: look_at behind left (153°), then behind right, went round the front to -153°. Home from
+    there, and a move_to behind right from behind left, did the same. The base never crossed behind.
+- **No lunging.** First built without limits, it swung from side to side every ~2 s, the claw jumping between
+  130 and 400 mm out. Near the base, the box's x limit (117.6) makes wide turns reach far out, and each lunge
+  overshot. Now one step moves the claw at most 120 mm and goes 70% of the way, so a turn the box only allows far
+  out is done in part.
+- **Talking.** When speech starts, it turns to the face it last saw (look_at, with the perk), however long ago,
+  because the person usually stays put. With no face seen yet, it perks up as before. It goes on following during
+  `HUSH_S`; only fidgets wait.
+- **Moods.** The quiet clock now resets on a follow step too: someone moving in view is something happening. A
+  person sitting still and silent does not reset it, so after 30 s it gets bored and looks around, as asked for
+  "inactivity". If they move, it follows them and is curious again. Curious with a face in view, it doesn't glance
+  away; it may tilt, perk at them (`look`) or play curious. `look` aims at the face last seen, else `PERSON`.
+- **Tested on the real arm** (2026-11-08, body and eyes only, 90 s, the user at the desk): it found the user 28°
+  off and turned to them within 0.5 s. It followed them as they moved, played curious, tilt and look at them in
+  between, got bored at 30 s with them sitting still, looked away, and found them again. With tilting and the
+  limits (75 s): steps of 20-30 mm, and no back and forth with the arm still. Where the face's reading jumped, it was
+  moving: it went from 9° to 17° right over 2 s with the arm standing still.
 
 ## Constraints
 
 - Python 3.10+ (the venv runs 3.14). The dependencies are `pyserial`, `mcp` (2.x), `anthropic` (2.x),
-  `prompt_toolkit`, `faster-whisper`, `sounddevice` and the CUDA 12 libraries from pip (see `requirements.txt`).
+  `prompt_toolkit`, `faster-whisper`, `sounddevice`, the CUDA 12 libraries from pip, and for the eyes
+  `opencv-python-headless`, `torch`, `transformers`, `accelerate`, `pillow` and `torchvision` (see `requirements.txt`).
   PortAudio comes from the system (Fedora: `portaudio`). faster-whisper's own `decode_audio` breaks with PyAV 19,
   but `ears.py` never uses it.
 - Keep each layer small and readable. The user prefers the least code that does the job.

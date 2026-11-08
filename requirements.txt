@@ -6,3 +6,9 @@ faster-whisper>=1.2   # speech to text (ears.py); pulls in ctranslate2, onnxrunt
 sounddevice>=0.5      # the mic, through PortAudio (Fedora: the portaudio package)
 nvidia-cublas-cu12    # the CUDA libraries Whisper runs on (GPU)
 nvidia-cudnn-cu12==9.*
+opencv-python-headless  # the camera and the face detector (eyes.py)
+torch                 # the vision model (eyes.py). Its CUDA 13 libraries install next to Whisper's CUDA 12 ones;
+transformers          # both load in one process (checked 2026-11-08)
+accelerate
+pillow
+torchvision
