@@ -1,4 +1,4 @@
-gentle: lean_in (comfort), calm (slow breathing), yawn
-questions: tilt (the dog head tilt), confused
-feelings: shy, proud, laugh
-play and social: play_bow, beg, greet (claw opens and shuts like a little wave)
+todo:
+- audio sleep/wake
+- idle animations and boredom. 
+- camera

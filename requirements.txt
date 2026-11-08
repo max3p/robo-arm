@@ -2,3 +2,7 @@ pyserial>=3.5
 mcp>=2.3
 anthropic>=2.6
 prompt_toolkit>=3.0
+faster-whisper>=1.2   # speech to text (ears.py); pulls in ctranslate2, onnxruntime and the Silero voice detector
+sounddevice>=0.5      # the mic, through PortAudio (Fedora: the portaudio package)
+nvidia-cublas-cu12    # the CUDA libraries Whisper runs on (GPU)
+nvidia-cudnn-cu12==9.*

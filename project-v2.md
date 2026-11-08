@@ -11,14 +11,15 @@ An LLM controls a desk robot arm through tool calls. The tools act in the physic
    exposed to the LLM as tools.
    - **Phase 2.5 (built, 2026-11-07):** `arm.py`, our own terminal chat on the Claude API. You talk to the arm as
      a pet and it answers with movement. Input, brain and body all run at once, and any of them can interrupt the others.
-   - **Phase 2.6 (next):** speech in, on the same architecture. The arm answers only with movement (decided 2026-11-07).
+   - **Phase 2.6 (built, 2026-11-07):** speech in. `ears.py` is always listening on the Blue Snowball and
+     transcribes locally on the GPU. The arm answers only with movement.
 3. **Phase 3 (later):** a camera on the arm and a perception worker that feeds scene information back to the LLM.
 
 ## Quick start
 
 ```
 python cli.py      # human control: draw the bounds, teach paths, test moves (see the docstring for commands)
-python arm.py      # chat with the arm as a pet (API key in .env). Ctrl-C stops it at once and quits
+python arm.py      # talk to the arm as a pet (or type; API key in .env). Ctrl-C stops it at once and quits
 claude mcp add robo-arm -- $PWD/.venv/bin/python $PWD/mcp_server.py     # already registered locally for this project
 ```
 
@@ -80,6 +81,7 @@ Human ──► cli.py ──► motion.py ──► arm          cli.py writes 
                                              mcp_server.py reads it once at startup, never writes it
 
 Human ──► arm.py: input ─► brain (Claude API, streaming) ─► body thread ─► motion.py ──► arm      (see Phase 2.5)
+         (voice ─► ears.py, or typed)
 ```
 
 The MCP client is the agent; there is no agent loop, LangGraph or API-key handling of our own. The design is split by who is in control:
@@ -90,6 +92,7 @@ The MCP client is the agent; there is no agent loop, LangGraph or API-key handli
 |---|---|
 | `motion.py` | Motion API: `Arm.go_to` (straight-line, safety-checked, sag-corrected), `gripper`, `play(points)`, `led`, `read`, `free`, `lock`; `perform(keys, size)` plays a gesture (see below); `abort` (a `threading.Event`: set from any thread, the move in progress holds the claw where it is and raises `Interrupted` within 20 ms); `check_target`; `describe_limits`; `load_state`/`save_state`; all tuned constants with the measurements behind them. **Never prints or prompts**: stdout carries the MCP protocol |
 | `arm.py` | The pet chat (Phase 2.5): prompt, brain loop, body thread, the tools and the system prompt. Knobs at the top: `MODEL`, `EFFORT`, `IDLE_S`, `PERSON` |
+| `ears.py` | Speech in (Phase 2.6): mic thread, Silero voice detector, faster-whisper on the GPU. Knobs at the top: `MIC`, `STT_MODEL`, `SILENCE_S`, `MIN_SPEECH_S`, `MIN_LOGPROB` |
 | `cli.py` | Human REPL. Commands: `read`, `move`, `grip` (radians), `home`, `led`, `bounds` (free the arm and sweep the claw; samples every 100 ms; the min/max becomes the box), `trace` (show the 6 faces of the box), `record NAME` (Enter per point, q to save; one point = a pose), `play NAME`, `gesture NAME [size]`, `look x y z`, `paths`, `delete NAME`. Ctrl-C stops motion |
 | `gestures.py` | The gestures as data: keyframes `K(secs, dr, da, dz, grip, led)` relative to the current pose (dr out from the base axis, da degrees of base turn, dz up), plus functions for the aimed ones (`sleep`, `wake_up`, `look_at`) |
 | `mcp_server.py` | AI tools (see below). The bounds are frozen at startup and the port opens lazily on the first tool call. `ValueError`/`RuntimeError` become `ToolError`, so the model sees the real reason plus the current pose |
@@ -353,10 +356,73 @@ keystrokes into `main()` (scratch script, not in the repo).
 **Not yet checked:**
 - Whether lean_in, calm and yawn look smooth at their slow speeds.
 - `PERSON` (600, 0, 300) is a guess at where the user sits. Measure it.
-- `logs/companion.jsonl` gets one line per reply: `first_s` (the delay to the first action), tokens and cache use.
 
-**Next, Phase 2.6 (speech in):** speech-to-text becomes a second producer for `Brain.hear`. Your voice interrupts the
-same way typing does. The arm still answers only with its body.
+## Phase 2.6: speech in, `ears.py` (built 2026-11-07)
+
+Always listening: what it hears goes to `Brain.hear` exactly like typed text, so speaking cuts off a reply in progress
+the same way typing does. Typing still works, for debugging. The arm still answers only with its body.
+
+```
+Blue Snowball (48 kHz, via PipeWire) ─► 16 kHz ─► Silero voice detector (32 ms frames)
+   speech starts ─► screen: (listening...)
+   0.5 s of quiet ends it ─► faster-whisper large-v3-turbo on the RTX 3060 Ti ─► screen: heard> ... ─► Brain.hear
+```
+
+**Decisions:**
+1. **Local, not a cloud service:** no second account or bill, nothing from an always-on mic leaves the PC, and it is
+   fast enough. `large-v3-turbo` in float16 loads in ~2.5 s (once warm) and transcribes a short sentence in ~0.25 s.
+   It is downloaded once (~1.6 GB) to `~/.cache/huggingface`.
+2. **Whisper only ever sees what the voice detector calls speech.** Given 3 s of room silence it wrote "Thank you."
+   with a no-speech probability of 0.0, so that probability is useless as a filter. Also dropped:
+   - blips with under 0.3 s of speech (a clunk, a cough), without transcribing them;
+   - transcripts with a mean log-probability under -1.0 (the invented "Thank you." scored -1.08; real speech scored
+     -0.04 to -0.45).
+3. **No wake word.** It hears everything, and the system prompt says not all of it is meant for it (TV, phone calls):
+   let it go by, or glance over. It's also told words are machine-transcribed and may be misheard: tilt or look
+   confused rather than guess. (Sleep plus a wake word is a future feature, below.)
+4. **The Snowball only opens at 48 kHz through PipeWire,** so every 3 samples are averaged down to 16 kHz.
+5. **The CUDA libraries come from pip** (`nvidia-cublas-cu12`, `nvidia-cudnn-cu12`); `ears.load_cuda_libs` loads
+   them, since they are not on the library path.
+6. **If the ears fail** (no mic, no GPU), the screen says so and typing still works.
+
+**The transcript log, for checking test runs.** Each run writes `logs/<start time>/`:
+- `transcript.jsonl`: one line per event, `t` in seconds from the start: `heard` (text, clip, speech length, Whisper
+  time, log-probability), `dropped` (why), `speech` (started talking), `typed`, `arm` (each action as queued, and how
+  far into the reply), `note` (what the program told the brain), `wrote`, `reply` (latency, tokens, cache), `cut`,
+  `error`, `start` and `stop`.
+- `001.wav`, `002.wav`, ...: every utterance the detector cut out, kept or dropped, so mishearings and false triggers
+  can be checked by replaying them.
+
+**Tested (2026-11-07):**
+- Synthetic speech (espeak-ng) fed straight to the detector: 4 phrases with noise and a hiss burst between them came
+  out word for word, and the hiss was ignored. 12 s of audio took 1.3 s to process.
+- End to end with a fake mic stream (the same phrases in real time), the real API and a fake arm:
+
+  | Heard | It did |
+  |---|---|
+  | "Hey buddy, I'm home." | look_at, then excited |
+  | "Do you want to play?" | play_bow |
+  | "I had a really rough day at work." | lean_in |
+  | "Don't boy." (espeak's "Good boy.", misheard) | tilt |
+
+  - From the end of speech to the first move took ~2 s: 0.5 s of silence wait, 0.25 s of Whisper, and 0.8-1.3 s of
+    Haiku.
+- The real Snowball opened and ran without a false trigger in a quiet room.
+
+**Not yet checked:**
+- Real voices (the user tests by talking to it; I read `logs/` afterwards).
+- Whether the arm's own motor noise triggers the detector. The test with the real arm couldn't run: the arm reported
+  an impossible pose (-250, 0, -238), which looks like the servos' 12 V supply was off.
+
+## Future feature: sleep and a wake word (asked for 2026-11-07, not built)
+
+For now the arm listens all the time (Phase 2.6), and every utterance it hears goes to the brain. Later:
+- After some time with nothing said to it, it goes to sleep (the `sleep` gesture), and the brain stops getting what it
+  hears.
+- While asleep, the ears listen only for a wake word (its name), locally with no API calls, using a small keyword
+  model (e.g. openWakeWord) or a cheap check of the Whisper transcript.
+- On the wake word it perks up (`wake_up`, then `look_at` the person) and goes back to always listening.
+- What this saves: API calls while nobody is talking to it (TV, phone calls), and it feels like a pet having a nap.
 
 ## Phase 3: camera and perception (do not build yet)
 
@@ -368,7 +434,9 @@ same way typing does. The arm still answers only with its body.
 
 ## Constraints
 
-- Python 3.10+ (the venv runs 3.14). The dependencies are `pyserial`, `mcp` (2.x), `anthropic` (2.x) and
-  `prompt_toolkit` (see `requirements.txt`).
+- Python 3.10+ (the venv runs 3.14). The dependencies are `pyserial`, `mcp` (2.x), `anthropic` (2.x),
+  `prompt_toolkit`, `faster-whisper`, `sounddevice` and the CUDA 12 libraries from pip (see `requirements.txt`).
+  PortAudio comes from the system (Fedora: `portaudio`). faster-whisper's own `decode_audio` breaks with PyAV 19,
+  but `ears.py` never uses it.
 - Keep each layer small and readable. The user prefers the least code that does the job.
 - Keep secrets out of the code. Don't print to stdout in anything the MCP server imports.

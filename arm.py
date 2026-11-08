@@ -5,8 +5,9 @@
 The API key goes in .env next to this file (ANTHROPIC_API_KEY=...); .env is git-ignored.
 
 Three parts run side by side and talk only through queues, so none waits for another:
-- Input: your messages. The prompt stays at the bottom while what the arm does scrolls above it (for debugging only:
-  the arm cannot talk, like a dog, and answers only with movement, the claw and its light).
+- Input: what you say (ears.py: always listening, transcribed locally) or type. The prompt stays at the bottom while
+  what it heard and what the arm does scroll above it (for debugging only: the arm cannot talk, like a dog, and
+  answers only with movement, the claw and its light).
 - Brain: Claude, streaming. Everything it does is a tool call (gesture, look_at, move_to, ...), and each call runs the
   moment it has been written, so the arm moves while Claude is still writing. A new message cuts off the reply in
   progress, and the next reply is told what had already been done. Tool results only say "queued"; they go back with
@@ -16,7 +17,11 @@ Three parts run side by side and talk only through queues, so none waits for ano
   it goes back to the resting pose by itself (not from sleep).
 New messages and failed actions wake the brain; finished actions are only noted for its next turn. After IDLE_S of
 quiet it is woken once, so it can doze off. The conversation is only ever appended to, never edited: that keeps the
-prompt cache and Claude's thinking valid. Each reply is logged to logs/companion.jsonl (latency, tokens, cache use).
+prompt cache and Claude's thinking valid.
+
+Each run is logged to logs/<start time>/transcript.jsonl, one JSON line per event, `t` in seconds from the start:
+heard / dropped (with the clip's .wav, saved next to it), speech (someone started talking), typed, arm (each action as
+it was queued), note (what the program told the brain), wrote, reply (latency, tokens, cache use), cut, error.
 """
 
 import asyncio
@@ -32,8 +37,9 @@ import anthropic
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 
+from ears import Ears
 from motion import (DEFAULT_SPEED, GRIP_CLOSED, GRIP_OPEN, MAX_SPEED, MIN_SPEED, START, Arm, Interrupted,
-                    describe_limits, load_state, now_iso)
+                    describe_limits, load_state)
 from gestures import GESTURES, look_at
 
 # Speed first: Haiku, at low effort (it thinks less, and skips thinking on simple turns). If it seems too dim, raise
@@ -42,7 +48,8 @@ MODEL, EFFORT = "claude-haiku-5-5", "low"
 IDLE_S = 120           # this long (s) without a message wakes the brain, once
 SETTLE_S, SETTLE_SPEED = 20, 150  # this long (s) without a movement, the arm goes back to rest by itself, this fast
 PERSON = (600, 0, 300)  # mm: where the person usually is, so the arm can look at them. A guess: measure and adjust
-LOG = Path(__file__).with_name("logs") / "companion.jsonl"
+RUN = Path(__file__).with_name("logs") / time.strftime("%Y-%m-%d_%H-%M-%S")  # this run's transcript and clips
+T0 = time.monotonic()
 
 
 def system_prompt(bounds: dict) -> str:
@@ -51,8 +58,11 @@ your person and you adore them. You understand everything they say, but like a d
 answer only with your body. Gestures, where you look, how close you come, your claw and the light on it are your whole \
 language. Nothing you write as text reaches anyone, so never write; act.
 
-For now your person types to you; soon you will hear them, and see them through a camera. You cannot see yet, so you \
-know the room only from what you are told.
+You hear through a microphone, always on. Words reach you transcribed by a machine, so they can be misheard: if \
+something makes no sense, look confused or tilt rather than guess. You hear everything said near you, and not all of \
+it is meant for you (a phone call, the TV, people talking to each other): let that go by, or just glance over, like a \
+dog would. Sometimes your person types to you instead. You cannot see yet (a camera will come), so you know the room \
+only from what you hear.
 
 Who you are:
 - Warm, curious, playful, loyal, a little cheeky. Your person is the most interesting thing in your world.
@@ -172,10 +182,10 @@ def show(text: str, dim=False) -> None:
     print(f"\033[2m{text}\033[0m" if dim else text, flush=True)
 
 
-def log(**record) -> None:
-    LOG.parent.mkdir(exist_ok=True)
-    with LOG.open("a") as f:
-        f.write(json.dumps({"at": now_iso(), **record}) + "\n")
+def log(kind: str, **record) -> None:
+    RUN.mkdir(parents=True, exist_ok=True)
+    with (RUN / "transcript.jsonl").open("a") as f:
+        f.write(json.dumps({"t": round(time.monotonic() - T0, 2), "kind": kind, **record}) + "\n")
 
 
 class Body:
@@ -252,6 +262,7 @@ class Brain:
         self.wake.put_nowait(None)
 
     def note(self, text: str, wake=False) -> None:
+        log("note", text=text)
         self.notes.append(text)
         if wake:
             self.wake.put_nowait(None)
@@ -273,6 +284,7 @@ class Brain:
                 [outcome] = await asyncio.gather(self.task, return_exceptions=True)
                 if isinstance(outcome, Exception):  # a bug: show it, and keep the brain alive
                     show(f"(brain crashed: {outcome!r})", dim=True)
+                    log("error", error=f"brain crashed: {outcome!r}")
                 if not news.done():
                     news.cancel()
                     break
@@ -298,15 +310,16 @@ class Brain:
             if did:
                 self.note("Your last reply was cut off by something new. Before that you had already: "
                           + "; ".join(did) + ".")
-            log(cut=True, did=len(did), secs=round(time.monotonic() - self.t0, 2))
+            log("cut", did=len(did), secs=round(time.monotonic() - self.t0, 2))
             raise
         except (anthropic.APIError, ValueError) as e:  # ValueError: tool input JSON the SDK could not parse at all
             show(f"(brain error: {e}. Send a message to try again.)", dim=True)
+            log("error", error=f"brain: {e}")
             if did:
                 self.note("Your last reply failed part way. Before that you had already: " + "; ".join(did) + ".")
             return
         del self.heard[:taken[0]], self.notes[:taken[1]]
-        log(first_s=round(self.first - self.t0, 2) if did else None, secs=round(time.monotonic() - self.t0, 2),
+        log("reply", first_s=round(self.first - self.t0, 2) if did else None, secs=round(time.monotonic() - self.t0, 2),
             stop=reply.stop_reason, model=reply.model, **{k: getattr(reply.usage, k) for k in (
                 "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")})
         if reply.stop_reason == "refusal":  # nothing to send back; don't send the same thing again either
@@ -326,6 +339,7 @@ class Brain:
         shows what the arm does, for debugging: the person is meant to read the arm, not the terminal."""
         if block.type == "text" and block.text.strip():  # it cannot talk; shown dimmed for debugging, not acted on
             show(f"  (wrote, unseen by anyone: {block.text.strip()})", dim=True)
+            log("wrote", text=block.text.strip())
         if block.type != "tool_use":
             return {}
         a = block.input if isinstance(block.input, dict) else {}
@@ -350,6 +364,7 @@ class Brain:
         if not did:
             self.first = time.monotonic()
             line += f"\033[2m   {self.first - self.t0:.1f} s"
+        log("arm", what=what, after_s=round(time.monotonic() - self.t0, 2))
         did.append(what)
         show(line + "\033[0m")
 
@@ -370,7 +385,24 @@ async def chat(brain: Brain) -> None:
         except (KeyboardInterrupt, EOFError):  # Ctrl-C or Ctrl-D: main() stops everything on the way out
             return
         if text:
+            log("typed", text=text)
             brain.hear(text)
+
+
+def heard(brain: Brain, kind: str, **info) -> None:
+    """What the ears report (on the event loop): shown for debugging, logged, and words go to the brain."""
+    log(kind, **info)
+    if kind == "heard":
+        show(f"heard> {info['text']}")
+        brain.hear(info["text"])
+    elif kind == "speech":
+        show("  (listening...)", dim=True)
+    elif kind == "dropped":
+        show(f"  (ignored a sound: {info['why']}{': ' + repr(info['text']) if info.get('text') else ''})", dim=True)
+    elif kind == "ready":
+        show(f"(ears on: {info['mic']})", dim=True)
+    elif kind == "error":
+        show(f"(ears failed: {info['error']}. Typing still works.)", dim=True)
 
 
 async def main() -> None:
@@ -385,23 +417,27 @@ async def main() -> None:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         sys.exit(f"no Claude API key: put it in {env} as ANTHROPIC_API_KEY=...")
     brain = Brain(anthropic.AsyncAnthropic(), system_prompt(state["bounds"]))
+    log("start", model=MODEL, effort=EFFORT)
+    loop = asyncio.get_running_loop()
+    ears = Ears(lambda kind, **info: loop.call_soon_threadsafe(lambda: heard(brain, kind, **info)), RUN)
     print("Connecting. The arm resets and moves to its resting pose: keep clear...")
     arm = await asyncio.to_thread(Arm, state["bounds"])
-    loop = asyncio.get_running_loop()
     brain.body = Body(arm, lambda text, wake: loop.call_soon_threadsafe(brain.note, text, wake))
     brain.note("You have just been switched on, at your resting pose.", wake=True)
-    print("Talk to it. Ctrl-C (or Ctrl-D) stops the arm and quits.")
+    print(f"Talk to it (or type). Ctrl-C (or Ctrl-D) stops the arm and quits. Log: {RUN}/")
     with patch_stdout(raw=True):
         workers = [asyncio.create_task(brain.run()), asyncio.create_task(idle(brain))]
         try:
             await chat(brain)
         finally:  # the kill switch works without the LLM: cut off the reply first, so it can queue nothing more
             brain.interrupt()
+            ears.close()
             for w in workers:
                 w.cancel()
             brain.body.stop()
             await asyncio.sleep(0.2)  # the body thread holds the claw where it is
             arm.close()
+            log("stop")
     print("Stopped: the arm holds where it is.")
 
 
