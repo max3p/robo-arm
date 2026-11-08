@@ -11,7 +11,7 @@ An LLM controls a desk robot arm through tool calls. The tools act in the physic
    exposed to the LLM as tools.
    - **Phase 2.5 (built, 2026-11-07):** `arm.py`, our own terminal chat on the Claude API. You talk to the arm as
      a pet and it answers with movement. Input, brain and body all run at once, and any of them can interrupt the others.
-   - **Phase 2.6 (next):** speech in (and later out) on the same architecture.
+   - **Phase 2.6 (next):** speech in, on the same architecture. The arm answers only with movement (decided 2026-11-07).
 3. **Phase 3 (later):** a camera on the arm and a perception worker that feeds scene information back to the LLM.
 
 ## Quick start
@@ -209,6 +209,14 @@ Measured on the arm after tuning (claw sampled at 12.5 Hz during each gesture):
   So fast gestures need about 15-20 % extra amplitude to look the size they were designed at.
 - Gestures play from any pose. If one does not fit, the claw first slides (same direction) toward the middle of the box,
   then it shrinks. Turned far left (y ~ 300) the curious lean and the turns shrank to 0.7x: that corner is tight.
+  Since 2026-11-07 a gesture that slid also slides back at the end. Before that it ended at the slid spot, and in live
+  sessions the claw wandered away from rest gesture by gesture.
+- **Eleven more gestures (2026-11-07)**, so the pet can say more without words: lean_in, calm, tilt, confused, shy,
+  play_bow, beg, proud, laugh, greet, yawn. All 18 relative gestures fit at full size, from rest and from a pose turned
+  left; the fake arm ran each one, and each ended where it began. lean_in, calm and yawn are deliberately slow
+  (median ~40 mm/s). The user hasn't yet checked by eye whether they look smooth.
+- **An interrupted gesture puts the light back** where it was before it began. Before, a flash cut off part way left the
+  LED stuck at that level, and later gestures kept returning to it.
 - **The resting pose `START`** (see Hardware) replaced the boot pose as the place the arm connects to and rests at.
   The user checked it on the arm. It is only 18 mm below the top of the box, so from there the upward gestures (happy,
   startle, excited) first slide 50-100 mm forward and down to fit; the others play in place.
@@ -243,7 +251,8 @@ Why it exists: Claude Code through MCP is turn-based. Every tool call blocks unt
 cut in. The companion is our own app on the Claude API, so we control the inputs, and nothing waits for anything else.
 
 **The parts.** One asyncio program; the three parts talk only through queues.
-- **Input:** a `prompt_toolkit` prompt. The arm's replies scroll above it while you type.
+- **Input:** a `prompt_toolkit` prompt. What the arm does scrolls above it while you type. The screen is for debugging
+  only: the end product has no visible terminal, and audio and video will be the input.
 - **Brain:** Claude, streaming. Only new messages and failures wake it.
   - The model is `claude-haiku-5-5` at effort `low`, because the user put speed first: the delay from a message to the
     first move matters most. At low effort it thinks less, and skips thinking on simple turns.
@@ -252,23 +261,35 @@ cut in. The companion is our own app on the Claude API, so we control the inputs
 - **Body:** one thread that owns the `Arm` and plays actions in order.
 
 **Decisions:**
-1. **Everything the pet does is a tool call:** `say`, `gesture`, `look_at`, `move_to`, `go_home`, `gripper`, `light`,
-   `wait`, `stop`.
-   - Speech is a tool too, so words and movements form one ordered stream. Phase 2.6 only has to make `say` speak.
-   - Opus 5.5 can turn text written between tool calls into hidden progress blocks, which `say` avoids, so switching
-     models needs no change. Stray text is still shown.
+1. **It cannot talk, like a dog: everything it does is a tool call** (`gesture`, `look_at`, `move_to`, `go_home`,
+   `gripper`, `light`, `wait`, `stop`), and movement, the claw and the light are its whole language. Decided by the
+   user on 2026-11-07.
+   - The first version had a `say` tool. It was dropped because the end product has no screen.
+   - Any text the model writes is shown dimmed, for debugging only, and never acted on. In the first live session after
+     the change it wrote none.
+   - Gestures always play at full size; the model can no longer pick a size. It used to shrink most of them to
+     0.5-0.7x, which made them hard to read. `perform` still shrinks one that can't fit anywhere.
+   - **The system prompt sets its character**: a pet, not an assistant. It's told to:
+     - answer yes or no with nod or shake;
+     - show confused or tilt for what it can't understand or can't do, and never pretend;
+     - match the mood: gentle for sadness, energy for good news, laugh for jokes, proud or shy for praise;
+     - let its feelings carry over between messages;
+     - vary its answers, using one to three actions;
+     - never make up facts about its body.
+   - **Settling:** after `SETTLE_S` (20 s) without a movement, the body goes back to rest by itself, at 150 mm/s. It
+     doesn't do this after sleep or after it's already home. The prompt also asks it to settle when things calm down.
 2. **Each call runs as soon as its block has streamed** (`eager_input_streaming`, acting at `content_block_stop`), so
    the arm moves while Claude is still writing.
    - Results only say "queued". They go back with the next message, so a reply costs one API call, not one per move.
    - Inputs arrive unvalidated, so the code checks them; a bad one gets an error result and wakes the brain again.
 3. **A new message cancels the reply in progress.** Nothing from the cut reply is sent back. Instead, the next request
-   carries a system note: "cut off ... you had already said X; queued nod".
+   carries a system note: "cut off ... you had already queued nod".
 4. **The conversation is only ever appended to.** That keeps the prompt cache and the model's preserved thinking valid
    (Haiku 5.5 and Opus 5.5 both reject a history that was edited under their thinking).
    Each turn is a user message (tool results first, then your words), plus a mid-conversation system message for the
    program's notes. Your words and the program's notes are never in the same block.
 5. **Body preemption:** the first body action of a newer reply drops what older replies left and stops the motion in
-   progress. A reply that only talks lets the current gesture finish.
+   progress. A reply that makes no movement (e.g. only `stop`) lets nothing new start.
 6. **Body to brain:**
    - Finished and cut-short actions become notes for the next turn, with the claw position.
    - A refused or failed action wakes the brain at once, even mid-reply, which cuts that reply off and restarts it
@@ -299,14 +320,43 @@ events with delays) and the fake serial class were used.
 - Preemption also worked: `happy` was cut at 0.7 s by `shake`, which played from that mid-gesture pose and ended within
   1 mm of where it started.
 
+**Live sessions (2026-11-07, real API and arm).** Three scripted sessions of about 25 messages each were run by piping
+keystrokes into `main()` (scratch script, not in the repo).
+- **Latency:** the first action came 0.7-1.6 s after each message (median ~0.95 s). Each reply was 50-240 output
+  tokens. The prompt cache was read on every turn, so only a few hundred new tokens were sent per reply.
+- **Sessions 1-2 (with `say`) found the issues** fixed above:
+  - the stuck LED, and the wander away from rest;
+  - speech printed twice (Haiku wrote text *and* called `say`);
+  - "look at me" barely moving from rest: `look_at` now leans 35 mm toward the point for a moment;
+  - gestures shrunk to 0.5-0.7x;
+  - a chatbot tone: a question every turn, explaining itself, once inventing a reason about its body;
+  - never going back to rest;
+  - the idle note reading "0 minutes".
+- **Session 3 (wordless).** Every reply was body language, and none was text. Its choices:
+
+  | Message | It did |
+  |---|---|
+  | "work was rough" | lean_in, soft light |
+  | "that helps" | calm |
+  | job news | excited |
+  | a joke | laugh |
+  | "pick up the pen" | confused |
+  | 17 × 23 | tilt |
+  | "want to play?" | play_bow |
+  | "useless" | sad, dim light |
+  | an apology | shy |
+  | "goodnight" | sleep |
+
+  - A refused move (z above the box) woke it, and it retried inside the box at once.
+  - It went back to rest by itself 23 s after its last move.
+
 **Not yet checked:**
-- The real API: latency, cache hits, and how well Haiku 5.5 follows the "everything is a tool, all in one reply" style.
+- Whether lean_in, calm and yawn look smooth at their slow speeds.
 - `PERSON` (600, 0, 300) is a guess at where the user sits. Measure it.
 - `logs/companion.jsonl` gets one line per reply: `first_s` (the delay to the first action), tokens and cache use.
-  Read it after a session.
 
-**Next, Phase 2.6 (speech):** speech-to-text becomes a second producer for `Brain.hear`. Your voice interrupts the same way
-typing does. Later, `say` drives text-to-speech, and speaking over it stops it.
+**Next, Phase 2.6 (speech in):** speech-to-text becomes a second producer for `Brain.hear`. Your voice interrupts the
+same way typing does. The arm still answers only with its body.
 
 ## Phase 3: camera and perception (do not build yet)
 

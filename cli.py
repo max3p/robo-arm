@@ -12,7 +12,7 @@
         record NAME             free the arm; Enter saves a point (must be inside the box), q + Enter stops and saves
                                 the path as NAME. One point = a named pose. The AI can play saved paths.
         play NAME[, speed]      replay a path in straight lines, speed in mm/s
-        gesture NAME[, size]    body language (nod, shake, curious, happy, excited, sad, startle, sleep, wake_up)
+        gesture NAME[, size]    body language: any name in gestures.GESTURES (nod, shake, happy, lean_in, ...)
         look(x, y, z)           turn to face a point
         paths                   list the saved paths
         delete NAME             remove a saved path

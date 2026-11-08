@@ -113,16 +113,16 @@ def _cart(p):
 
 def trajectory(bounds: dict, start, keys, size: float, shift=(0, 0)) -> list:
     """The 50 Hz samples (x, y, z, t, led) of a gesture from `start` (r, a, z, opening, led), eased into and out of each
-    keyframe. A nonzero `shift` (dr, dz) first moves the claw there (same direction) and plays the gesture around that.
-    Interpolated in cylindrical coordinates, so a change of `a` is a turn of the base, not a slide. Segments
+    keyframe. A nonzero `shift` (dr, dz) first moves the claw there (same direction), plays the gesture around that,
+    and moves back to `start` at the end, so a gesture that had to slide still ends where it began. Interpolated in cylindrical coordinates, so a change of `a` is a turn of the base, not a slide. Segments
     are stretched so the peak speed stays under MAX_SPEED. Raises ValueError if any sample leaves the bounds or reach,
     or comes nearer the base axis than the keep-out (or than the start, if that is nearer already)."""
     base = (start[0] + shift[0], start[1], start[2] + shift[1])
-    lead = [(0.6, *base, start[3], start[4])] if any(shift) else []
+    lead, back = ([(0.6, *base, start[3], start[4])], [(0.6, *start)]) if any(shift) else ([], [])
     prev, out = start, []
     for secs, *frame in lead + [(secs, base[0] + dr * size, base[1] + da * size, base[2] + dz * size,
                                  start[3] if grip is None else grip, start[4] if led is None else led)
-                                for secs, dr, da, dz, grip, led in keys]:
+                                for secs, dr, da, dz, grip, led in keys] + back:
         seg = lambda n: [_cart([a + (b - a) * u * u * (3 - 2 * u) for a, b in zip(prev, frame)])
                          for u in (j / n for j in range(1, n + 1))]
         coarse = [_cart(prev)] + seg(20)
@@ -362,6 +362,10 @@ class Arm:
                     if round(level) != led:
                         led = round(level)
                         self._send({"T": 114, "led": led})
+            except Interrupted:  # cut off mid-flash: put the light back as it was, or it stays stuck at that level
+                led = round(self.led_level)
+                self._send({"T": 114, "led": led})
+                raise
             finally:
                 self.led_level = led
             self.target = samples[-1][:3]

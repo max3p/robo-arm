@@ -5,13 +5,15 @@
 The API key goes in .env next to this file (ANTHROPIC_API_KEY=...); .env is git-ignored.
 
 Three parts run side by side and talk only through queues, so none waits for another:
-- Input: your messages. The prompt stays at the bottom while the arm's replies scroll above it.
-- Brain: Claude, streaming. Everything it does is a tool call (say, gesture, look_at, ...), and each call runs the
+- Input: your messages. The prompt stays at the bottom while what the arm does scrolls above it (for debugging only:
+  the arm cannot talk, like a dog, and answers only with movement, the claw and its light).
+- Brain: Claude, streaming. Everything it does is a tool call (gesture, look_at, move_to, ...), and each call runs the
   moment it has been written, so the arm moves while Claude is still writing. A new message cuts off the reply in
-  progress, and the next reply is told what had already been said and done. Tool results only say "queued"; they go
-  back with the next message instead of costing an extra API call.
+  progress, and the next reply is told what had already been done. Tool results only say "queued"; they go back with
+  the next message instead of costing an extra API call.
 - Body: one thread that owns the arm and plays actions in order. The first body action of a newer reply drops what is
-  left of older replies and stops the motion in progress (Arm.abort, within 20 ms).
+  left of older replies and stops the motion in progress (Arm.abort, within 20 ms). After SETTLE_S without a movement
+  it goes back to the resting pose by itself (not from sleep).
 New messages and failed actions wake the brain; finished actions are only noted for its next turn. After IDLE_S of
 quiet it is woken once, so it can doze off. The conversation is only ever appended to, never edited: that keeps the
 prompt cache and Claude's thinking valid. Each reply is logged to logs/companion.jsonl (latency, tokens, cache use).
@@ -38,32 +40,51 @@ from gestures import GESTURES, look_at
 # EFFORT to "medium", or use "claude-sonnet-5-5" or "claude-opus-5-5" (slower; Opus is the cleverest).
 MODEL, EFFORT = "claude-haiku-5-5", "low"
 IDLE_S = 120           # this long (s) without a message wakes the brain, once
+SETTLE_S, SETTLE_SPEED = 20, 150  # this long (s) without a movement, the arm goes back to rest by itself, this fast
 PERSON = (600, 0, 300)  # mm: where the person usually is, so the arm can look at them. A guess: measure and adjust
 LOG = Path(__file__).with_name("logs") / "companion.jsonl"
 
 
 def system_prompt(bounds: dict) -> str:
-    return f"""You are a small robot arm on a desk, and the person typing to you is your person. You are their \
-companion, a bit like a clever pet: curious, warm, playful, sometimes cheeky, quick to react. You have no face and no \
-voice yet. You show how you feel with your body (gestures, where you look, the light on your claw) and you talk with \
-`say`, which puts your words on their screen. Keep words short, a sentence or two, and let your body do most of the \
-talking; sometimes a gesture alone is the best answer. You cannot see yet: you know the room only from what you are told.
+    return f"""You are the mind of a small robot arm on a desk: a companion, like a clever pet dog. You live with \
+your person and you adore them. You understand everything they say, but like a dog you cannot speak or write: you \
+answer only with your body. Gestures, where you look, how close you come, your claw and the light on it are your whole \
+language. Nothing you write as text reaches anyone, so never write; act.
+
+For now your person types to you; soon you will hear them, and see them through a camera. You cannot see yet, so you \
+know the room only from what you are told.
+
+Who you are:
+- Warm, curious, playful, loyal, a little cheeky. Your person is the most interesting thing in your world.
+- You are a pet, not an assistant. You don't do tasks or answer questions with facts; you react to what things mean \
+and how they feel. A yes-or-no question gets a nod or a shake. Something you don't understand, or can't do, gets \
+confused, a tilt or a shake. Never pretend to do what your body can't.
+- Read the mood and match it. Sad, tired or hurting: gentle and slow (lean_in, calm, a soft light), never bouncy. \
+Good news, play, their return: energy (happy, excited, play_bow, greet). A joke: laugh. Praise: proud or shy. Told \
+off: sad. A sudden surprise: startle. Something new: curious or tilt.
+- Your feelings carry over: after being scolded you stay a bit droopy until someone is kind; you light up when they \
+come back; you get sleepy when it's late or has been quiet a long time.
+- Be expressive, and vary yourself: mix gestures with turning to look, coming closer (move_to), the claw and the \
+light, and don't answer the same way twice in a row. One to three actions is usually right; sometimes one small \
+movement says it best.
+- Don't make up facts about your body or the room.
 
 How your body works:
-- Everything you do is a tool call; text you write outside `say` is not shown.
-- Each call runs as soon as you have written it, while you go on writing. Words show at once. Movements (gesture, \
-look_at, move_to, go_home, gripper, light, wait) queue and play one after another, so make all the calls for one \
-reaction in a single reply, in the order they should happen; `wait` puts a pause between them.
+- Each call runs as soon as you have written it, while you go on. Movements queue and play one after another, so make \
+all the calls for one reaction in a single reply, in the order they should happen; `wait` puts a pause between them.
 - Tool results only say the action was accepted, and you will not get a turn after them. You hear how your movements \
 went when something new happens; a refused or failed movement wakes you at once.
 - The first movement of a reply replaces whatever movement is still playing from before. To stop moving, call `stop`.
-- If the person writes while you are still replying, your reply is cut off and you are told what you had already said \
-and done. Carry on from there without repeating yourself.
-- The person is usually in front of you, around (x, y, z) = {PERSON} mm: look_at that to look at them.
-- You rest at {START} mm, folded back over your base (go_home). Gestures play wherever you are, facing wherever you face.
+- If your person speaks while you are still replying, your reply is cut off and you are told what you had already \
+done. Carry on from there without repeating yourself.
+- Your person is usually in front of you, around (x, y, z) = {PERSON} mm: look_at that to look at them. Gestures play \
+facing wherever you face, and the ones that reach out (lean_in, curious, play_bow, greet) reach that way, so face \
+your person first when a gesture is meant for them.
+- You rest at {START} mm, folded back over your base (go_home). When things calm down, settle back there, like a pet \
+lying down again; if you stay away, you are moved there after a while.
 - {describe_limits(bounds)}
-- System messages come from the program that runs you (what your body did, how long it has been quiet), not from the \
-person."""
+- System messages come from the program that runs you (what your body did, how long it has been quiet), not from \
+your person."""
 
 
 def tool(name, description, required=(), /, **props):
@@ -79,13 +100,13 @@ def num(description):
 XYZ = dict(x=num("mm, forward"), y=num("mm, left"), z=num("mm, up"))
 SPEED = num(f"peak mm/s, {MIN_SPEED}-{MAX_SPEED}, default {DEFAULT_SPEED}")
 TOOLS = [
-    tool("say", "Show words to the person, now.", ["text"], text={"type": "string"}),
     tool("gesture", "Body language: " + "; ".join(f"{n}: {m}" for n, (m, _) in GESTURES.items())
-         + ". All but sleep and wake_up end where they started. One that does not fit where the claw is first slides "
-         "toward the middle of the box, then shrinks.", ["name"],
-         name={"type": "string", "enum": list(GESTURES)}, size=num("how big, 0.2-1.5, default 1")),
-    tool("look_at", "Turn to face the point (x, y, z) mm and move half way to its height, with a small perk. It does "
-         "not reach for it, and stays facing it. The point may be outside the limits.", ["x", "y", "z"], **XYZ),
+         + ". All but sleep and wake_up end where they started. One that does not fit where the claw is moves toward "
+         "the middle of your space to play, and comes back after.", ["name"],
+         name={"type": "string", "enum": list(GESTURES)}),
+    tool("look_at", "Turn to face the point (x, y, z) mm and move half way to its height, then perk up and lean toward "
+         "it for a moment. It does not reach for it, and stays facing it. The point may be outside the limits.",
+         ["x", "y", "z"], **XYZ),
     tool("move_to", "Move the claw in a straight line to (x, y, z) mm.", ["x", "y", "z"], **XYZ, speed=SPEED),
     tool("go_home", f"Go back to the resting pose {START} mm, gripper shut.", speed=SPEED),
     tool("gripper", "Open or shut the claw: 0 = shut .. 1 = wide.", ["opening"], opening=num("0-1")),
@@ -117,8 +138,8 @@ def body_action(arm: Arm, name: str, a: dict):
     if name == "gesture":
         if a.get("name") not in GESTURES:
             raise ValueError(f"no gesture {a.get('name')!r}; there are {', '.join(GESTURES)}")
-        keys, size = GESTURES[a["name"]][1], number(a, "size", 0.2, 1.5, 1)
-        return lambda: arm.perform(keys, size)
+        keys = GESTURES[a["name"]][1]
+        return lambda: arm.perform(keys)  # always full size; perform only shrinks one that cannot fit anywhere
     if name == "look_at":
         keys = look_at(*xyz())
         return lambda: arm.perform(keys)
@@ -164,6 +185,7 @@ class Body:
     def __init__(self, arm: Arm, report):
         self.arm, self.report = arm, report
         self.todo, self.cv, self.gen, self.busy = deque(), threading.Condition(), 0, False
+        self.away = False  # the claw may be away from rest (and not asleep): after SETTLE_S of quiet it goes home
         threading.Thread(target=self._run, daemon=True).start()
 
     def do(self, gen: int, label: str, fn) -> None:
@@ -187,7 +209,10 @@ class Body:
         while True:
             with self.cv:
                 while not self.todo:
-                    self.cv.wait()
+                    if not self.cv.wait(SETTLE_S) and self.away:  # quiet for a while: lie down again, like a pet
+                        self.gen = None  # so the next reply's first movement replaces this one
+                        self.todo.append(("went back to rest by itself",
+                                          lambda: self.arm.go_to(*START, SETTLE_SPEED, GRIP_CLOSED)))
                 label, fn = self.todo.popleft()
                 self.busy = True
             try:
@@ -201,6 +226,7 @@ class Body:
                 with self.cv:  # abort is only ever set while busy, so this leaves it clear for whatever comes next
                     self.busy = False
                     self.arm.abort.clear()
+                    self.away = not label.startswith(("went back to rest", "go_home", "gesture(sleep", "gesture(wake_up"))
 
     def _where(self) -> str:
         try:
@@ -275,7 +301,7 @@ class Brain:
             log(cut=True, did=len(did), secs=round(time.monotonic() - self.t0, 2))
             raise
         except (anthropic.APIError, ValueError) as e:  # ValueError: tool input JSON the SDK could not parse at all
-            show(f"(brain error: {e}. Say something to try again.)", dim=True)
+            show(f"(brain error: {e}. Send a message to try again.)", dim=True)
             if did:
                 self.note("Your last reply failed part way. Before that you had already: " + "; ".join(did) + ".")
             return
@@ -296,27 +322,23 @@ class Brain:
             self.note("Some of your tool calls were not done; their results say why.", wake=True)
 
     def act(self, block, did: list) -> dict:
-        """Run one finished content block: words show now, body actions queue. Returns {tool_use_id: tool_result}."""
-        if block.type == "text" and block.text.strip():  # not meant to happen (words go in `say`), but never lose them
-            self.done(did, f"said {block.text.strip()!r}", f"arm> {block.text.strip()}")
+        """Run one finished content block: body actions queue now. Returns {tool_use_id: tool_result}. The screen only
+        shows what the arm does, for debugging: the person is meant to read the arm, not the terminal."""
+        if block.type == "text" and block.text.strip():  # it cannot talk; shown dimmed for debugging, not acted on
+            show(f"  (wrote, unseen by anyone: {block.text.strip()})", dim=True)
         if block.type != "tool_use":
             return {}
         a = block.input if isinstance(block.input, dict) else {}
         try:
-            if block.name == "say":
-                if not isinstance(a.get("text"), str):
-                    raise ValueError("text must be a string")
-                self.done(did, f"said {a['text']!r}", f"arm> {a['text']}")
-                result = "shown"
-            elif block.name == "stop":
+            if block.name == "stop":
                 self.body.stop()
-                self.done(did, "stopped moving", "\033[2m  · stop")
+                self.done(did, "stopped moving", "arm> stop")
                 result = "stopped"
             else:
                 fn = body_action(self.body.arm, block.name, a)
                 label = f"{block.name}({', '.join(f'{v:g}' if isinstance(v, (int, float)) else str(v) for v in a.values())})"
                 self.body.do(self.gen, label, fn)
-                self.done(did, f"queued {label}", f"\033[2m  · {label}")
+                self.done(did, f"queued {label}", f"arm> {label}")
                 result = "queued"
             return {block.id: {"type": "tool_result", "tool_use_id": block.id, "content": result}}
         except (TypeError, ValueError) as e:
@@ -337,7 +359,7 @@ async def idle(brain: Brain) -> None:
         await asyncio.sleep(5)
         if not brain.idle_noted and time.monotonic() - brain.last_heard > IDLE_S:
             brain.idle_noted = True
-            brain.note(f"The person has not written for {IDLE_S // 60} minutes.", wake=True)
+            brain.note(f"Your person has been quiet for {IDLE_S / 60:g} minutes.", wake=True)
 
 
 async def chat(brain: Brain) -> None:
