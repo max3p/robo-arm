@@ -2,7 +2,7 @@
 
 The bounds and paths are read from arm_state.json once, at startup; no tool can change them. They are sent to the model
 before it does anything (in the server instructions and in each motion tool's description). Moves are capped at
-MAX_SPEED (raised to MIN_SPEED when slower) and every target is checked by arm.go_to before anything is sent.
+MAX_SPEED (raised to MIN_SPEED when slower) and every target is checked by Arm.go_to (motion.py) before anything is sent.
 The serial port opens on the first tool call that needs the arm, which resets the board (~10 s to its boot pose), then
 the arm moves to the resting pose START.
 
@@ -18,8 +18,8 @@ from typing import Literal
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from arm import (BASE_KEEPOUT_MM, DEFAULT_SPEED, START, MAX_SPEED, MIN_SPEED, GRIP_CLOSED, GRIP_OPEN, REACH_MAX_MM,
-                 REACH_MIN_MM, TOLERANCE_MM, Arm, load_state)
+from motion import (BASE_KEEPOUT_MM, DEFAULT_SPEED, START, MAX_SPEED, MIN_SPEED, GRIP_CLOSED, GRIP_OPEN, REACH_MAX_MM,
+                 REACH_MIN_MM, TOLERANCE_MM, Arm, describe_limits, load_state)
 from gestures import GESTURES, look_at as look_keys
 
 
@@ -28,11 +28,7 @@ if not STATE["bounds"]:
     sys.exit("no bounds in arm_state.json: run `python cli.py` and draw them first")
 BOUNDS, PATHS = STATE["bounds"], STATE["paths"]
 
-LIMITS = (f"Hard limits (mm; origin at the shoulder pivot; x forward, y left, z up): "
-          + ", ".join(f"{a} {lo:g} to {hi:g}" for a, (lo, hi) in BOUNDS.items())
-          + f". The claw must also stay {REACH_MIN_MM}-{REACH_MAX_MM} mm from the origin, and a straight path may not pass"
-          f" within {BASE_KEEPOUT_MM} mm of the base's vertical axis (x=y=0). Targets outside are refused before the arm"
-          f" moves. Speed (peak, mm/s) is {MIN_SPEED}-{MAX_SPEED}, default {DEFAULT_SPEED}; moves are smooth and eased at both ends.")
+LIMITS = describe_limits(BOUNDS)
 INSTRUCTIONS = (f"Controls a real 4-DOF desk robot arm (Waveshare RoArm-M2-S) that moves its claw in straight lines. "
                 f"{LIMITS} Bounds drawn by a human on {STATE['bounds_drawn']}; you cannot change them. "
                 f"Saved movements (play them by name): {', '.join(PATHS) or 'none'}. "

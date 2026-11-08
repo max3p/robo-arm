@@ -24,7 +24,7 @@ import math
 import select
 import sys
 
-from arm import GRIP_CLOSED, START, MAX_SPEED, Arm, check_target, load_state, now_iso, save_state
+from motion import GRIP_CLOSED, START, MAX_SPEED, Arm, check_target, load_state, now_iso, save_state
 from gestures import GESTURES, look_at
 
 SAMPLE_S = 0.1   # the bounds sweep samples the claw position this often

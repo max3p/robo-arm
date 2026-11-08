@@ -7,20 +7,26 @@ An LLM controls a desk robot arm through tool calls. The tools act in the physic
 1. **Phase 1 (done, 2026-11-07):** safe motion primitives (move, nudge, home, gripper, LED, replay a taught path),
    exposed to Claude as an MCP server. A human draws the workspace bounds by hand, and the AI cannot cross them.
 2. **Phase 2 (in progress):** a **catalog of known movements** that make the arm read as a clever companion or pet
-   with a personality: body language (nod, shake, curious, happy, sad, startle, wave, shrug, sleep, wake_up, look_at),
+   with a personality: body language (nod, shake, curious, happy, excited, sad, startle, sleep, wake_up, look_at),
    exposed to the LLM as tools.
+   - **Phase 2.5 (built, 2026-11-07):** `arm.py`, our own terminal chat on the Claude API. You talk to the arm as
+     a pet and it answers with movement. Input, brain and body all run at once, and any of them can interrupt the others.
+   - **Phase 2.6 (next):** speech in (and later out) on the same architecture.
 3. **Phase 3 (later):** a camera on the arm and a perception worker that feeds scene information back to the LLM.
 
 ## Quick start
 
 ```
 python cli.py      # human control: draw the bounds, teach paths, test moves (see the docstring for commands)
+python arm.py      # chat with the arm as a pet (API key in .env). Ctrl-C stops it at once and quits
 claude mcp add robo-arm -- $PWD/.venv/bin/python $PWD/mcp_server.py     # already registered locally for this project
 ```
 
-- The MCP server and the CLI cannot run at the same time, because the serial port is exclusive.
+- The CLI, the companion and the MCP server cannot run at the same time, because the serial port is exclusive.
+  Close the Claude Code chat (or disconnect the server with `/mcp`) before running the companion.
 - The server reads `arm_state.json` only when it starts. After you change the bounds or paths, run `/mcp` to reconnect it.
-- Opening the port resets the board. The arm then moves to its boot pose, which takes up to about 10 s. Keep the workspace clear every time.
+- Opening the port resets the board. The arm then moves to its boot pose, which takes up to about 10 s, and from there
+  to the resting pose `START`. Keep the workspace clear every time.
 - The user account must be in the `dialout` group to open `/dev/ttyUSB0`.
 
 ## Hardware (Waveshare RoArm-M2-S)
@@ -35,7 +41,11 @@ claude mcp add robo-arm -- $PWD/.venv/bin/python $PWD/mcp_server.py     # alread
 - The arm runs inverse kinematics itself, so we send Cartesian targets.
   - Coordinates are in mm, with the origin at the shoulder pivot: x forward, y left, z up.
   - The two links are about 239 and 280 mm, so the claw can reach 41-519 mm from the origin.
-- The boot pose is about (309, 4, 228) mm with the gripper shut. Joints read b≈0°, s≈0°, e≈91°, h≈180°.
+- The boot pose (`HOME`) is about (309, 4, 228) mm with the gripper shut. Joints read b≈0°, s≈0°, e≈91°, h≈180°.
+  It is an upside-down L stretched forward, the worst pose for sag, and the firmware always boots to it.
+- **The resting pose `START` is (161.5, -2.0, 213.6) mm, gripper shut:** the arm folded back over the base, set by hand
+  by the user on 2026-11-07 and checked on the arm. `Arm(bounds)` waits for the boot motion to settle, then moves there
+  at 200 mm/s (skipped if `START` is outside the box). `go_home`, the CLI's `home` and the end of `wake_up` all go there.
 
 ## Arm command reference
 
@@ -62,12 +72,14 @@ Things the firmware does not do, which our code handles:
 ## Architecture (as built)
 
 ```
-Claude (Code / Desktop) ──MCP tool call──► mcp_server.py ──► arm.py (Arm) ──serial──► arm
+Claude (Code / Desktop) ──MCP tool call──► mcp_server.py ──► motion.py (Arm) ──serial──► arm
          ▲                                       │                  │
          └──── result: measured pose / error ◄───┘◄── T:105 feedback┘
 
-Human ──► cli.py ──► arm.py ──► arm          cli.py writes arm_state.json (bounds + taught paths)
+Human ──► cli.py ──► motion.py ──► arm          cli.py writes arm_state.json (bounds + taught paths)
                                              mcp_server.py reads it once at startup, never writes it
+
+Human ──► arm.py: input ─► brain (Claude API, streaming) ─► body thread ─► motion.py ──► arm      (see Phase 2.5)
 ```
 
 The MCP client is the agent; there is no agent loop, LangGraph or API-key handling of our own. The design is split by who is in control:
@@ -76,9 +88,10 @@ The MCP client is the agent; there is no agent loop, LangGraph or API-key handli
 
 | File | Role |
 |---|---|
-| `arm.py` | Motion API: `Arm.go_to` (straight-line, safety-checked, sag-corrected), `gripper`, `play(points)`, `led`, `read`, `free`, `lock`; `perform(keys, size)` plays a gesture (see below); `check_target`; `load_state`/`save_state`; all tuned constants with the measurements behind them. **Never prints or prompts**: stdout carries the MCP protocol |
+| `motion.py` | Motion API: `Arm.go_to` (straight-line, safety-checked, sag-corrected), `gripper`, `play(points)`, `led`, `read`, `free`, `lock`; `perform(keys, size)` plays a gesture (see below); `abort` (a `threading.Event`: set from any thread, the move in progress holds the claw where it is and raises `Interrupted` within 20 ms); `check_target`; `describe_limits`; `load_state`/`save_state`; all tuned constants with the measurements behind them. **Never prints or prompts**: stdout carries the MCP protocol |
+| `arm.py` | The pet chat (Phase 2.5): prompt, brain loop, body thread, the tools and the system prompt. Knobs at the top: `MODEL`, `EFFORT`, `IDLE_S`, `PERSON` |
 | `cli.py` | Human REPL. Commands: `read`, `move`, `grip` (radians), `home`, `led`, `bounds` (free the arm and sweep the claw; samples every 100 ms; the min/max becomes the box), `trace` (show the 6 faces of the box), `record NAME` (Enter per point, q to save; one point = a pose), `play NAME`, `gesture NAME [size]`, `look x y z`, `paths`, `delete NAME`. Ctrl-C stops motion |
-| `gestures.py` | The gestures as data: keyframes `K(secs, dr, da, dz, grip, led)` relative to the current pose (dr out from the base axis, da degrees of base turn, dz up), plus functions for the aimed ones (`sleep`, `wake_up`, `look_at`) and `ready(bounds)`, a pose with room for all of them |
+| `gestures.py` | The gestures as data: keyframes `K(secs, dr, da, dz, grip, led)` relative to the current pose (dr out from the base axis, da degrees of base turn, dz up), plus functions for the aimed ones (`sleep`, `wake_up`, `look_at`) |
 | `mcp_server.py` | AI tools (see below). The bounds are frozen at startup and the port opens lazily on the first tool call. `ValueError`/`RuntimeError` become `ToolError`, so the model sees the real reason plus the current pose |
 | `arm_state.json` | `{"bounds": {"x": [lo, hi], "y": .., "z": ..}, "bounds_drawn": iso, "paths": {name: [[x, y, z, t], ..]}}`. Current box: x 117.6-478.4, y -102.4-368.1, z -102-231.4 |
 
@@ -90,7 +103,7 @@ The MCP client is the agent; there is no agent loop, LangGraph or API-key handli
 | `get_pose()` | Measured `{x, y, z, gripper_open}`, where `gripper_open` runs from 0 (shut) to 1 (wide) |
 | `move_to(x, y, z, speed=300)` | Straight-line move. Returns the measured pose, or an error |
 | `move_by(dx, dy, dz, speed=300)` | Relative move from the **last target**, so sag doesn't accumulate. If the arm isn't near that target, it moves from the measured pose |
-| `go_home(speed=300)` | Goes to the boot pose (309, 4, 228) and shuts the gripper |
+| `go_home(speed=300)` | Goes to the resting pose `START` (161.5, -2, 213.6) and shuts the gripper |
 | `gripper(opening)` | 0..1. It stops short on an object, and the result shows where it ended |
 | `light(brightness, blinks=0)` | LED from 0 to 1, with optional blinks first |
 | `play(name, speed=300)` | Replays a hand-taught path from `arm_state.json` |
@@ -120,8 +133,9 @@ The bounds reach the model before it acts in three ways: in the server instructi
 - **Post-move check:** a move that still ends more than 15 mm from its target raises an error, which says the arm is safe where it is.
 - **Limitations:**
   - Only the claw tip is bounded, not the elbow or forearm, so draw the box smaller than the real free space.
-  - The first move after connecting starts from the boot pose, which may be outside the box.
-  - The AI cannot be stopped mid-move except with the power switch.
+  - If `START` is outside a redrawn box, the arm stays at the boot pose after connecting, which may be outside the box too.
+  - Through MCP, the AI cannot be stopped mid-move except with the power switch. The companion can stop it: Ctrl-C (which also quits),
+    the `stop` tool and every newer reply set `Arm.abort`.
 
 ## Phase 1: what was done and how it went
 
@@ -129,7 +143,7 @@ The bounds reach the model before it acts in three ways: in the server instructi
    It was built and mock-tested before the arm arrived. Once the hardware was on the desk, the user replaced it all with one hand-tested
    `arm.py` REPL: straight-line moves, a hand-drawn bounds box, and record/replay. Lesson: with real hardware in hand, small and measured
    beats large and speculative.
-2. **Split human/AI.** `arm.py` became a silent library. The REPL moved to `cli.py`, the bounds and paths were saved to JSON,
+2. **Split human/AI.** `arm.py` (now `motion.py`) became a silent library. The REPL moved to `cli.py`, the bounds and paths were saved to JSON,
    and `mcp_server.py` was added. Making Claude the agent through MCP removed the whole agent layer.
 3. **Tested on the real arm**, first with the library and then through a real MCP stdio client.
    - Every bounds, reach, NaN and keep-out refusal moved the arm 0.0 mm.
@@ -195,6 +209,9 @@ Measured on the arm after tuning (claw sampled at 12.5 Hz during each gesture):
   So fast gestures need about 15-20 % extra amplitude to look the size they were designed at.
 - Gestures play from any pose. If one does not fit, the claw first slides (same direction) toward the middle of the box,
   then it shrinks. Turned far left (y ~ 300) the curious lean and the turns shrank to 0.7x: that corner is tight.
+- **The resting pose `START`** (see Hardware) replaced the boot pose as the place the arm connects to and rests at.
+  The user checked it on the arm. It is only 18 mm below the top of the box, so from there the upward gestures (happy,
+  startle, excited) first slide 50-100 mm forward and down to fit; the others play in place.
 - Not yet checked by eye: whether the slowest parts (sad's mope at ~70-130 mm/s) look stepped, and LED lag.
 
 What Phase 2 should add, roughly in order:
@@ -218,6 +235,79 @@ Rules that carry over:
 - Skills only call primitives, so every move still goes through the checks in `go_to` or `perform`.
 - Use measured results, not assumptions: test every new motion pattern on the arm and record the numbers here.
 
+## Phase 2.5: the pet chat, `arm.py` (built 2026-11-07)
+
+Naming: the program you run is `arm.py`. The motion library, which was `arm.py` through Phase 2, is now `motion.py`.
+
+Why it exists: Claude Code through MCP is turn-based. Every tool call blocks until the arm has settled, and nothing can
+cut in. The companion is our own app on the Claude API, so we control the inputs, and nothing waits for anything else.
+
+**The parts.** One asyncio program; the three parts talk only through queues.
+- **Input:** a `prompt_toolkit` prompt. The arm's replies scroll above it while you type.
+- **Brain:** Claude, streaming. Only new messages and failures wake it.
+  - The model is `claude-haiku-5-5` at effort `low`, because the user put speed first: the delay from a message to the
+    first move matters most. At low effort it thinks less, and skips thinking on simple turns.
+  - If it seems too dim, raise `EFFORT`, or switch `MODEL` to Sonnet 5.5 or Opus 5.5 (slower).
+  - The design started on Opus 5.5.
+- **Body:** one thread that owns the `Arm` and plays actions in order.
+
+**Decisions:**
+1. **Everything the pet does is a tool call:** `say`, `gesture`, `look_at`, `move_to`, `go_home`, `gripper`, `light`,
+   `wait`, `stop`.
+   - Speech is a tool too, so words and movements form one ordered stream. Phase 2.6 only has to make `say` speak.
+   - Opus 5.5 can turn text written between tool calls into hidden progress blocks, which `say` avoids, so switching
+     models needs no change. Stray text is still shown.
+2. **Each call runs as soon as its block has streamed** (`eager_input_streaming`, acting at `content_block_stop`), so
+   the arm moves while Claude is still writing.
+   - Results only say "queued". They go back with the next message, so a reply costs one API call, not one per move.
+   - Inputs arrive unvalidated, so the code checks them; a bad one gets an error result and wakes the brain again.
+3. **A new message cancels the reply in progress.** Nothing from the cut reply is sent back. Instead, the next request
+   carries a system note: "cut off ... you had already said X; queued nod".
+4. **The conversation is only ever appended to.** That keeps the prompt cache and the model's preserved thinking valid
+   (Haiku 5.5 and Opus 5.5 both reject a history that was edited under their thinking).
+   Each turn is a user message (tool results first, then your words), plus a mid-conversation system message for the
+   program's notes. Your words and the program's notes are never in the same block.
+5. **Body preemption:** the first body action of a newer reply drops what older replies left and stops the motion in
+   progress. A reply that only talks lets the current gesture finish.
+6. **Body to brain:**
+   - Finished and cut-short actions become notes for the next turn, with the claw position.
+   - A refused or failed action wakes the brain at once, even mid-reply, which cuts that reply off and restarts it
+     knowing about the failure.
+   - After `IDLE_S` (120 s) without a message, the brain is woken once, so it can doze off.
+7. **Safety stays in code.**
+   - Ctrl-C stops the arm, cancels the reply and quits, without an LLM round trip.
+   - Every limit is still checked by `motion.py` when an action runs.
+   - A stop holds the claw at its *measured* pose. Otherwise the servos carry on to the last streamed target, which
+     trails the claw by up to ~75 mm at speed.
+8. **Refusals:** Haiku 5.5 has safety classifiers but no server-side fallback. A refused reply is dropped, not resent,
+   and a note tells the brain about it. (On Opus 5.5, `fallbacks: "default"` could be turned back on.)
+9. **The API key lives in `.env`** (`ANTHROPIC_API_KEY=...`), which is git-ignored and readable only by its owner.
+   `arm.py` reads it at start; a key already set in the shell wins.
+
+**Tested (2026-11-07), without the real API or arm:** a scripted fake API (real SDK, `httpx2.MockTransport`, server-sent
+events with delays) and the fake serial class were used.
+- Checked: cut-off replies and their notes, preemption, `stop`, a refused move waking the brain mid-reply, a bad
+  gesture name waking it after the reply, and Ctrl-C mid-reply.
+- Every request's history was checked: each `tool_use` is answered first in the next user message, and a system
+  message is never followed by a user message.
+- The whole UI ran through `main()` with piped keystrokes.
+- The fake API answered in 0.3-0.7 s; real latency is still to be measured.
+
+**Stopping on the real arm (2026-11-07)**, via `Body.stop()` part way through excited, nod and a `look_at` turn:
+- The body was free about 0.12 s after the stop.
+- From then the claw drifted 4-17 mm, against up to ~75 mm if it had carried on to the last streamed target.
+- Preemption also worked: `happy` was cut at 0.7 s by `shake`, which played from that mid-gesture pose and ended within
+  1 mm of where it started.
+
+**Not yet checked:**
+- The real API: latency, cache hits, and how well Haiku 5.5 follows the "everything is a tool, all in one reply" style.
+- `PERSON` (600, 0, 300) is a guess at where the user sits. Measure it.
+- `logs/companion.jsonl` gets one line per reply: `first_s` (the delay to the first action), tokens and cache use.
+  Read it after a session.
+
+**Next, Phase 2.6 (speech):** speech-to-text becomes a second producer for `Brain.hear`. Your voice interrupts the same way
+typing does. Later, `say` drives text-to-speech, and speaking over it stops it.
+
 ## Phase 3: camera and perception (do not build yet)
 
 - A camera mounted on the arm. A perception worker (a thread or process) owns the camera, runs open-vocabulary detectors
@@ -228,6 +318,7 @@ Rules that carry over:
 
 ## Constraints
 
-- Python 3.10+ (the venv runs 3.14). The only dependencies are `pyserial` and `mcp` (2.x).
+- Python 3.10+ (the venv runs 3.14). The dependencies are `pyserial`, `mcp` (2.x), `anthropic` (2.x) and
+  `prompt_toolkit` (see `requirements.txt`).
 - Keep each layer small and readable. The user prefers the least code that does the job.
 - Keep secrets out of the code. Don't print to stdout in anything the MCP server imports.

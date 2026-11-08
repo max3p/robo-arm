@@ -1,367 +1,390 @@
-"""Motion API for a Waveshare RoArm-M2-S over USB serial, shared by the human CLI (cli.py) and the AI (mcp_server.py).
+"""Talk to the arm as a pet: a terminal chat with Claude as the brain and the arm as the body, all running at once.
 
-This module never prints or prompts: in the MCP server, stdout carries the protocol.
-The bounds box and the named paths live in arm_state.json. Only cli.py writes that file (the bounds are drawn by hand);
-the MCP server reads it once at startup and cannot change it.
+    python arm.py        Ctrl-C (or Ctrl-D) stops the arm and the brain at once (no LLM involved) and quits
 
-Gestures (gestures.py) go through perform(): keyframes relative to the current pose, flowing without stops, every
-20 ms sample checked against the same limits before anything moves.
-Every other move goes through go_to(): a straight line, refused before anything is sent if the target is outside the box, out
-of reach, or the path passes too close to the base. The box is convex, so a straight line between two points inside it
-stays inside it. The box limits the claw TIP only, not the elbow or forearm: draw it smaller than the real free space.
-Opening the port resets the board, and the arm then moves to its start pose (~10 s), which may be outside the box.
+The API key goes in .env next to this file (ANTHROPIC_API_KEY=...); .env is git-ignored.
 
-Protocol (Waveshare wiki), 115200 baud, one JSON object per line, angles in radians:
-    {"T":105}                              request feedback; reply {"T":1051,"x","y","z","b","s","e","t",...}
-    {"T":1041,"x":..,"y":..,"z":..,"t":..} go to XYZ (mm), direct and unsmoothed; t = gripper angle
-    {"T":106,"cmd":t,"spd","acc"}          gripper only
-    {"T":122,"b","s","e","h","spd","acc"}  joint angles in DEGREES; its spd/acc stay set for later T:1041 moves
-    {"T":102,"base","shoulder","elbow","hand","spd","acc"}   go to joint angles (spd 0 = fastest)
-    {"T":210,"cmd":0|1}                    joints free (move by hand) / locked
-    {"T":114,"led":0..255}                 gripper LED brightness
+Three parts run side by side and talk only through queues, so none waits for another:
+- Input: your messages. The prompt stays at the bottom while the arm's replies scroll above it.
+- Brain: Claude, streaming. Everything it does is a tool call (say, gesture, look_at, ...), and each call runs the
+  moment it has been written, so the arm moves while Claude is still writing. A new message cuts off the reply in
+  progress, and the next reply is told what had already been said and done. Tool results only say "queued"; they go
+  back with the next message instead of costing an extra API call.
+- Body: one thread that owns the arm and plays actions in order. The first body action of a newer reply drops what is
+  left of older replies and stops the motion in progress (Arm.abort, within 20 ms).
+New messages and failed actions wake the brain; finished actions are only noted for its next turn. After IDLE_S of
+quiet it is woken once, so it can doze off. The conversation is only ever appended to, never edited: that keeps the
+prompt cache and Claude's thinking valid. Each reply is logged to logs/companion.jsonl (latency, tokens, cache use).
 """
 
+import asyncio
 import json
-import math
+import os
+import sys
 import threading
 import time
-from datetime import datetime
+from collections import deque
 from pathlib import Path
 
-import serial
-from serial.tools import list_ports
+import anthropic
+from prompt_toolkit import PromptSession
+from prompt_toolkit.patch_stdout import patch_stdout
 
-STATE_FILE = Path(__file__).with_name("arm_state.json")
-RATE_HZ = 50        # every move is streamed as a new target this often, so a stop takes effect within 20 ms
-# Speeds measured on the arm (2026-11-07, 370 mm moves): smooth and on the line from 100 to 500 mm/s. Above ~600 the
-# servos saturate (800 asked gave ~700, 26 mm off the line). Below 100 the 50 Hz micro-steps are too small and the
-# motion turns stop-go jerky, so slower requests are raised to MIN_SPEED.
-MAX_SPEED = 500      # mm/s hard cap on the PEAK speed of any move, whatever the caller asks for
-MIN_SPEED = 100      # mm/s
-DEFAULT_SPEED = 300  # mm/s
-TOLERANCE_MM = 15   # a move that ends farther than this from the target (after the sag correction) is reported as failed
-# Under its own weight the arm stops short, worst moving UP to high, stretched poses (10-20 mm low at home). go_to then
-# aims past the target by the measured error (up to 2 passes); the aim point may be up to SAG_MAX_MM outside the box,
-# the claw is not. Sometimes (after boot, or with warm servos?) it stalls 25-35 mm low; the capped push still helps then.
-SAG_MIN_MM, SAG_MAX_MM = 3, 25
-# The firmware does not guard T:1041 against targets the arm cannot reach (its IK yields NaN, which becomes a garbage
-# servo goal), so go_to refuses them first. Targets are measured from the shoulder pivot (the x, y, z origin); the arm's
-# two links are ~239 and ~280 mm, so it reaches 41..519 mm. These limits keep well inside that. Derived from firmware constants.
-REACH_MIN_MM, REACH_MAX_MM = 100, 480
-BASE_KEEPOUT_MM = 100  # the claw must stay this far (in x, y) from the base's vertical axis: nearer is a folded arm that may hit itself
-XYZ_SERVO_SPEED_DEG = 360  # deg/s servo speed limit set before xyz moves: headroom above MAX_SPEED, not a target speed
-XYZ_SERVO_ACC_DEG = 20    # servo acceleration limit for xyz moves; 20 lags the stream least at speed (2 lagged ~25% more)
-JOINT_ACC = 10            # servo-side acceleration limit for lock()
-GRIP_CLOSED, GRIP_OPEN = 3.14, 1.08  # gripper angle t (radians), wiki default clamp range; check on the arm
-HOME = (309.0, 4.0, 228.0)  # mm: the pose the arm boots to (measured over 4 boots, 2026-11-07), gripper shut
-# The firmware's boot pose is an upside-down L, stretched forward: the worst pose for sag. START is folded back over the
-# base (set by hand by the user, 2026-11-07). Arm() moves there right after boot, and it is the resting pose.
-START = (161.5, -2.0, 213.6)
-GRIP_SPEED, GRIP_ACC = 8.0, 50  # rad/s peak and servo acceleration: full range ~1.6 s; the servo itself caps it there
+from motion import (DEFAULT_SPEED, GRIP_CLOSED, GRIP_OPEN, MAX_SPEED, MIN_SPEED, START, Arm, Interrupted,
+                    describe_limits, load_state, now_iso)
+from gestures import GESTURES, look_at
+
+# Speed first: Haiku, at low effort (it thinks less, and skips thinking on simple turns). If it seems too dim, raise
+# EFFORT to "medium", or use "claude-sonnet-5-5" or "claude-opus-5-5" (slower; Opus is the cleverest).
+MODEL, EFFORT = "claude-haiku-5-5", "low"
+IDLE_S = 120           # this long (s) without a message wakes the brain, once
+PERSON = (600, 0, 300)  # mm: where the person usually is, so the arm can look at them. A guess: measure and adjust
+LOG = Path(__file__).with_name("logs") / "companion.jsonl"
 
 
-def load_state() -> dict:
-    """{"bounds": {"x": [lo, hi], "y": .., "z": ..} or None, "bounds_drawn": iso time, "paths": {name: [[x, y, z, t], ..]}}"""
-    try:
-        state = json.loads(STATE_FILE.read_text())
-    except FileNotFoundError:
-        state = {}
-    return {"bounds": None, "bounds_drawn": None, "paths": {}} | state
+def system_prompt(bounds: dict) -> str:
+    return f"""You are a small robot arm on a desk, and the person typing to you is your person. You are their \
+companion, a bit like a clever pet: curious, warm, playful, sometimes cheeky, quick to react. You have no face and no \
+voice yet. You show how you feel with your body (gestures, where you look, the light on your claw) and you talk with \
+`say`, which puts your words on their screen. Keep words short, a sentence or two, and let your body do most of the \
+talking; sometimes a gesture alone is the best answer. You cannot see yet: you know the room only from what you are told.
+
+How your body works:
+- Everything you do is a tool call; text you write outside `say` is not shown.
+- Each call runs as soon as you have written it, while you go on writing. Words show at once. Movements (gesture, \
+look_at, move_to, go_home, gripper, light, wait) queue and play one after another, so make all the calls for one \
+reaction in a single reply, in the order they should happen; `wait` puts a pause between them.
+- Tool results only say the action was accepted, and you will not get a turn after them. You hear how your movements \
+went when something new happens; a refused or failed movement wakes you at once.
+- The first movement of a reply replaces whatever movement is still playing from before. To stop moving, call `stop`.
+- If the person writes while you are still replying, your reply is cut off and you are told what you had already said \
+and done. Carry on from there without repeating yourself.
+- The person is usually in front of you, around (x, y, z) = {PERSON} mm: look_at that to look at them.
+- You rest at {START} mm, folded back over your base (go_home). Gestures play wherever you are, facing wherever you face.
+- {describe_limits(bounds)}
+- System messages come from the program that runs you (what your body did, how long it has been quiet), not from the \
+person."""
 
 
-def save_state(state: dict) -> None:
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=1))
-    tmp.replace(STATE_FILE)  # atomic: a crash mid-write cannot leave a half-written bounds file
+def tool(name, description, required=(), /, **props):
+    return {"name": name, "description": description, "eager_input_streaming": True,  # inputs stream as written
+            "input_schema": {"type": "object", "properties": props, "required": list(required),
+                             "additionalProperties": False}}
 
 
-def now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+def num(description):
+    return {"type": "number", "description": description}
 
 
-def check_target(bounds: dict, x, y, z) -> None:
-    """Raise ValueError unless (x, y, z) is numbers inside the box and the arm's safe reach."""
-    for axis, v in dict(x=x, y=y, z=z).items():
-        lo, hi = bounds[axis]
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:  # also rejects NaN
-            raise ValueError(f"{axis} must be a number in [{lo:g}, {hi:g}], got {round(v, 1) if isinstance(v, float) else v!r}")
-    if not REACH_MIN_MM <= math.dist((0, 0, 0), (x, y, z)) <= REACH_MAX_MM:
-        raise ValueError(f"({x:g}, {y:g}, {z:g}) is outside the arm's safe reach "
-                         f"({REACH_MIN_MM}-{REACH_MAX_MM} mm from the shoulder pivot)")
+XYZ = dict(x=num("mm, forward"), y=num("mm, left"), z=num("mm, up"))
+SPEED = num(f"peak mm/s, {MIN_SPEED}-{MAX_SPEED}, default {DEFAULT_SPEED}")
+TOOLS = [
+    tool("say", "Show words to the person, now.", ["text"], text={"type": "string"}),
+    tool("gesture", "Body language: " + "; ".join(f"{n}: {m}" for n, (m, _) in GESTURES.items())
+         + ". All but sleep and wake_up end where they started. One that does not fit where the claw is first slides "
+         "toward the middle of the box, then shrinks.", ["name"],
+         name={"type": "string", "enum": list(GESTURES)}, size=num("how big, 0.2-1.5, default 1")),
+    tool("look_at", "Turn to face the point (x, y, z) mm and move half way to its height, with a small perk. It does "
+         "not reach for it, and stays facing it. The point may be outside the limits.", ["x", "y", "z"], **XYZ),
+    tool("move_to", "Move the claw in a straight line to (x, y, z) mm.", ["x", "y", "z"], **XYZ, speed=SPEED),
+    tool("go_home", f"Go back to the resting pose {START} mm, gripper shut.", speed=SPEED),
+    tool("gripper", "Open or shut the claw: 0 = shut .. 1 = wide.", ["opening"], opening=num("0-1")),
+    tool("light", "The light on the claw: brightness 0 = off .. 1 = full, after `blinks` quick flashes (default 0).",
+         ["brightness"], brightness=num("0-1"), blinks={"type": "integer", "description": "0-10"}),
+    tool("wait", "Pause between movements.", ["seconds"], seconds=num("0-30")),
+    tool("stop", "Stop moving now and drop the movements still queued."),
+]
 
 
-def _cart(p):
-    """(r mm from the base axis, a degrees of base turn, z mm, gripper opening 0..1, led) -> (x, y, z, t, led)."""
-    a = math.radians(p[1])
-    return p[0] * math.cos(a), p[0] * math.sin(a), p[2], GRIP_CLOSED - p[3] * (GRIP_CLOSED - GRIP_OPEN), p[4]
+def number(a: dict, key, lo, hi, default=None):
+    """Tool inputs stream unvalidated (eager_input_streaming), so check each one before acting on it."""
+    v = a.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
+        raise ValueError(f"{key} must be a number in [{lo:g}, {hi:g}], got {v!r}")
+    return v
 
 
-def trajectory(bounds: dict, start, keys, size: float, shift=(0, 0)) -> list:
-    """The 50 Hz samples (x, y, z, t, led) of a gesture from `start` (r, a, z, opening, led), eased into and out of each
-    keyframe. A nonzero `shift` (dr, dz) first moves the claw there (same direction) and plays the gesture around that.
-    Interpolated in cylindrical coordinates, so a change of `a` is a turn of the base, not a slide. Segments
-    are stretched so the peak speed stays under MAX_SPEED. Raises ValueError if any sample leaves the bounds or reach,
-    or comes nearer the base axis than the keep-out (or than the start, if that is nearer already)."""
-    base = (start[0] + shift[0], start[1], start[2] + shift[1])
-    lead = [(0.6, *base, start[3], start[4])] if any(shift) else []
-    prev, out = start, []
-    for secs, *frame in lead + [(secs, base[0] + dr * size, base[1] + da * size, base[2] + dz * size,
-                                 start[3] if grip is None else grip, start[4] if led is None else led)
-                                for secs, dr, da, dz, grip, led in keys]:
-        seg = lambda n: [_cart([a + (b - a) * u * u * (3 - 2 * u) for a, b in zip(prev, frame)])
-                         for u in (j / n for j in range(1, n + 1))]
-        coarse = [_cart(prev)] + seg(20)
-        length = sum(math.dist(p[:3], q[:3]) for p, q in zip(coarse, coarse[1:]))
-        out += seg(max(1, round(max(secs, length * 1.5 / MAX_SPEED) * RATE_HZ)))
-        prev = frame
-    for x, y, z, _, _ in out:
-        check_target(bounds, x, y, z)
-        if math.hypot(x, y) < min(BASE_KEEPOUT_MM, start[0] - 0.5):
-            raise ValueError(f"it would pass {math.hypot(x, y):.0f} mm from the base axis (keep-out {BASE_KEEPOUT_MM} mm)")
-    return out
+def pause(arm: Arm, secs: float) -> None:
+    if arm.abort.wait(secs):
+        raise Interrupted("interrupted")
 
 
-def find_port() -> str:
-    ports = [p.device for p in list_ports.comports() if p.vid]  # USB serial devices only
-    if len(ports) != 1:
-        raise RuntimeError(f"cannot pick the arm's port (found {ports or 'none'}); pass it as Arm(bounds, port)")
-    return ports[0]
+def body_action(arm: Arm, name: str, a: dict):
+    """Check a body tool's input now; return what the body thread will run later. Raises ValueError on bad input.
+    The limits are checked by motion.py when it runs, against wherever the claw is by then."""
+    xyz = lambda: [number(a, k, -1000, 1000) for k in "xyz"]
+    speed = lambda: number(a, "speed", MIN_SPEED, MAX_SPEED, DEFAULT_SPEED)
+    if name == "gesture":
+        if a.get("name") not in GESTURES:
+            raise ValueError(f"no gesture {a.get('name')!r}; there are {', '.join(GESTURES)}")
+        keys, size = GESTURES[a["name"]][1], number(a, "size", 0.2, 1.5, 1)
+        return lambda: arm.perform(keys, size)
+    if name == "look_at":
+        keys = look_at(*xyz())
+        return lambda: arm.perform(keys)
+    if name == "move_to":
+        (x, y, z), s = xyz(), speed()
+        return lambda: arm.go_to(x, y, z, s)
+    if name == "go_home":
+        s = speed()
+        return lambda: arm.go_to(*START, s, GRIP_CLOSED)
+    if name == "gripper":
+        t = GRIP_CLOSED - number(a, "opening", 0, 1) * (GRIP_CLOSED - GRIP_OPEN)
+        return lambda: arm.gripper(t)
+    if name == "light":
+        level, blinks = round(number(a, "brightness", 0, 1) * 255), int(number(a, "blinks", 0, 10, 0))
+        def light():
+            for _ in range(blinks):
+                arm.led(255)
+                pause(arm, 0.15)
+                arm.led(0)
+                pause(arm, 0.15)
+            arm.led(level)
+        return light
+    if name == "wait":
+        secs = number(a, "seconds", 0, 30)
+        return lambda: pause(arm, secs)
+    raise ValueError(f"no tool {name!r}")
 
 
-class Arm:
-    def __init__(self, bounds: dict | None, port: str | None = None):
-        """Open the port (which resets the board: the arm moves to its boot pose, HOME) and, given bounds, move to START."""
-        self.target = None  # last (x, y, z) go_to aimed for: move_by builds on it, so sag does not add up
-        self.commanded = None  # last (x, y, z) actually sent: the target plus the sag correction
-        self.led_level = 0  # the arm does not report its LED; it boots dark
-        self.bounds = bounds  # {"x": (lo, hi), "y": ..., "z": ...} in mm; every move is refused while this is None
-        self.lock_ = threading.RLock()  # one physical action at a time (MCP tools run in worker threads)
-        self.ser = serial.Serial()
-        self.ser.port, self.ser.baudrate, self.ser.timeout = port or find_port(), 115200, 0.2
-        self.ser.dtr = self.ser.rts = False  # set before open(): asserting them holds the ESP32 in reset
-        self.ser.open()
-        deadline = time.monotonic() + 25  # the arm moves to its start pose while it boots
+def show(text: str, dim=False) -> None:
+    print(f"\033[2m{text}\033[0m" if dim else text, flush=True)
+
+
+def log(**record) -> None:
+    LOG.parent.mkdir(exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(json.dumps({"at": now_iso(), **record}) + "\n")
+
+
+class Body:
+    """Owns the arm, in its own thread. Actions run in order; the first action of a newer reply (a new `gen`) drops
+    what older replies left and stops the one in progress. `report(text, wake)` is called from this thread."""
+
+    def __init__(self, arm: Arm, report):
+        self.arm, self.report = arm, report
+        self.todo, self.cv, self.gen, self.busy = deque(), threading.Condition(), 0, False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def do(self, gen: int, label: str, fn) -> None:
+        with self.cv:
+            if gen != self.gen:
+                self.gen = gen
+                self._drop()
+            self.todo.append((label, fn))
+            self.cv.notify()
+
+    def stop(self) -> None:
+        with self.cv:
+            self._drop()
+
+    def _drop(self) -> None:
+        self.todo.clear()
+        if self.busy:
+            self.arm.abort.set()
+
+    def _run(self) -> None:
         while True:
+            with self.cv:
+                while not self.todo:
+                    self.cv.wait()
+                label, fn = self.todo.popleft()
+                self.busy = True
             try:
-                self._feedback()
-                break
-            except RuntimeError:
-                if time.monotonic() > deadline:
-                    self.ser.close()
-                    raise RuntimeError("arm never answered; is the 12 V adapter plugged in and switched on?")
-        if bounds:  # wait out the boot motion, then leave its sag-prone pose for START (skipped if START is outside the box)
-            self._settle(lambda: self.read()[:3], 0.5, timeout=15)
-            try:
-                self.go_to(*START, speed=200, t=GRIP_CLOSED)
-            except ValueError:
-                pass
+                fn()
+                self.report(f"{label} done{self._where()}", False)
+            except Interrupted:
+                self.report(f"{label} cut short{self._where()}", False)
+            except Exception as e:  # refused (ValueError) or failed (RuntimeError, serial): the brain hears at once
+                self.report(f"{label} failed: {e}{self._where()}", True)
+            finally:
+                with self.cv:  # abort is only ever set while busy, so this leaves it clear for whatever comes next
+                    self.busy = False
+                    self.arm.abort.clear()
 
-    def _send(self, cmd: dict) -> None:
-        self.ser.write((json.dumps(cmd) + "\n").encode())
+    def _where(self) -> str:
+        try:
+            x, y, z, _ = self.arm.read()
+            return f", claw at ({x:.0f}, {y:.0f}, {z:.0f})"
+        except Exception:
+            return ""
 
-    def _feedback(self) -> dict:
-        with self.lock_:
-            self.ser.reset_input_buffer()
-            self.ser.write(b'{"T":105}\n')
-            deadline = time.monotonic() + 1.0
-            while time.monotonic() < deadline:
-                try:
-                    msg = json.loads(self.ser.readline())
-                except ValueError:  # boot text, echoes, partial lines, read timeouts
-                    continue
-                if isinstance(msg, dict) and msg.get("T") == 1051:
-                    return msg
-        raise RuntimeError("no feedback")
 
-    def read(self) -> tuple[float, float, float, float]:
-        """Measured (x, y, z, t): claw position in mm and gripper angle in radians."""
-        fb = self._feedback()
-        return fb["x"], fb["y"], fb["z"], fb["t"]
+class Brain:
+    def __init__(self, client: anthropic.AsyncAnthropic, system: str):
+        self.client, self.system, self.body = client, system, None
+        self.history = []  # the conversation so far, as sent: only ever appended to
+        self.results = []  # tool_result blocks owed for the last reply's tool calls, sent with the next message
+        self.heard, self.notes = [], []  # the person's messages and the program's notes, not sent yet
+        self.wake = asyncio.Queue()
+        self.gen, self.task, self.t0, self.first = 0, None, 0, 0
+        self.last_heard, self.idle_noted = time.monotonic(), False
 
-    def joints(self) -> tuple[float, float, float, float]:
-        fb = self._feedback()
-        return fb["b"], fb["s"], fb["e"], fb["t"]
+    def hear(self, text: str) -> None:
+        self.heard.append(text)
+        self.last_heard, self.idle_noted = time.monotonic(), False
+        self.wake.put_nowait(None)
 
-    def _glide(self, start, goal, duration, make_cmd) -> None:
-        """Stream targets from start to goal in a straight line, speeding up and slowing down smoothly (smoothstep: speed
-        0 at both ends, peak 1.5x the average)."""
-        t0 = time.monotonic()  # positions come from the clock, not from summed sleeps, so timing jitter cannot cause jerks
+    def note(self, text: str, wake=False) -> None:
+        self.notes.append(text)
+        if wake:
+            self.wake.put_nowait(None)
+
+    def interrupt(self) -> None:
+        if self.task:
+            self.task.cancel()
+
+    async def run(self) -> None:
         while True:
-            u = min((time.monotonic() - t0) / duration, 1.0)
-            f = u * u * (3 - 2 * u)
-            self._send(make_cmd([a + (b - a) * f for a, b in zip(start, goal)]))
-            if u >= 1.0:
-                return
-            time.sleep(1 / RATE_HZ)
-
-    def _settle(self, read, eps, timeout=5):
-        """The firmware has no 'move finished' signal: settled = two consecutive reads agree to within eps."""
-        last = now = read()
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            time.sleep(0.1)
-            now = read()
-            if math.dist(now, last) < eps:
-                break
-            last = now
-        return now
-
-    def _xyz_mode(self, fb) -> None:
-        """T:1041 takes its servo speed and acceleration from firmware globals, and every T:102 (lock) resets them to
-        0 = unlimited, which turns 50 Hz micro-steps into stop-go jerks. T:122 sets them and leaves them set, so send it
-        before streaming, with the current angles (no motion)."""
-        b, sh, e, h = (math.degrees(fb[k]) for k in "bset")
-        self._send({"T": 122, "b": b, "s": sh, "e": e, "h": h, "spd": XYZ_SERVO_SPEED_DEG, "acc": XYZ_SERVO_ACC_DEG})
-
-    def _correct(self, goal, aim, t, now):
-        """Sag correction: `aim` was last sent and the claw settled at `now`. Aim past `goal` by what it missed, up to 2
-        passes; the push past `goal` never exceeds SAG_MAX_MM. Returns the measured position."""
-        for _ in range(2):
-            if math.dist(now, goal) <= SAG_MIN_MM:
-                break
-            push = [a - n for a, n in zip(aim, now)]  # (aim - goal) + (goal - now): the old push plus the new miss
-            k = min(1, SAG_MAX_MM / math.hypot(*push))
-            new = [g + p * k for g, p in zip(goal, push)]
-            if math.dist((0, 0, 0), new) > REACH_MAX_MM + SAG_MAX_MM:
-                break
-            self._glide((*aim, t), (*new, t), 0.3, lambda p: {"T": 1041, "x": round(p[0], 1), "y": round(p[1], 1),
-                                                              "z": round(p[2], 1), "t": round(p[3], 3)})
-            aim, now = new, self._settle(lambda: self.read()[:3], 0.5)
-        self.commanded = tuple(aim)
-        return now
-
-    def go_to(self, x: float, y: float, z: float, speed: float = DEFAULT_SPEED, t: float | None = None):
-        """Move the claw to (x, y, z) mm in a straight line at `speed` mm/s (peak), and the gripper to angle t (None = keep
-        it). Returns the measured final (x, y, z). Raises ValueError, before anything moves, if the target is outside the
-        bounds or reach or the path passes too near the base; RuntimeError if the arm does not get there."""
-        if not self.bounds:
-            raise RuntimeError("no bounds: draw them first with cli.py")
-        check_target(self.bounds, x, y, z)
-        if t is not None and not GRIP_OPEN <= t <= GRIP_CLOSED:
-            raise ValueError(f"gripper angle {t!r} is not in [{GRIP_OPEN}, {GRIP_CLOSED}]")
-        speed = min(max(speed, MIN_SPEED), MAX_SPEED)
-        with self.lock_:
-            fb = self._feedback()
-            start, goal = (fb["x"], fb["y"], fb["z"]), (x, y, z)
-            d = [g - a for a, g in zip(start[:2], goal[:2])]  # closest approach of the straight path to the base axis, in plan view
-            f = min(max(-sum(a * v for a, v in zip(start, d)) / (sum(v * v for v in d) or 1), 0), 1)
-            closest = math.hypot(*(a + f * v for a, v in zip(start, d)))
-            if closest < BASE_KEEPOUT_MM and closest < math.hypot(*start[:2]) - 0.5:  # moving away from the base is always allowed
-                raise ValueError(f"the straight path to ({x:g}, {y:g}, {z:g}) passes {closest:.0f} mm from the base axis "
-                                 f"(keep-out {BASE_KEEPOUT_MM} mm); choose a target that avoids it")
-            self._xyz_mode(fb)
-            t = fb["t"] if t is None else t
-            self._glide((*start, fb["t"]), (*goal, t), max(math.dist(start, goal) * 1.5 / speed, 0.2),
-                        lambda p: {"T": 1041, "x": round(p[0], 1), "y": round(p[1], 1), "z": round(p[2], 1),
-                                   "t": round(p[3], 3)})
-            self.target = self.commanded = goal
-            now = self._settle(lambda: self.read()[:3], 0.5)
-            now = self._correct(goal, goal, t, now)
-        error = math.dist(now, goal)
-        if error > TOLERANCE_MM:
-            raise RuntimeError(f"arm ended {error:.0f} mm from the target, at ({now[0]:.0f}, {now[1]:.0f}, {now[2]:.0f}): "
-                               "sagging under load, or blocked. It is safe where it is")
-        return now
-
-    def gripper(self, t: float) -> float:
-        """Move only the gripper to angle t (GRIP_CLOSED = shut, GRIP_OPEN = wide). Returns the measured angle, which
-        stops short of t when the gripper closes on something."""
-        if isinstance(t, bool) or not isinstance(t, (int, float)) or not GRIP_OPEN <= t <= GRIP_CLOSED:
-            raise ValueError(f"gripper angle {t!r} is not in [{GRIP_OPEN}, {GRIP_CLOSED}]")
-        with self.lock_:  # streamed like go_to: a single T:106 starts late, and _settle mistook that for done
-            t0 = self.read()[3]
-            self._glide((t0,), (t,), max(abs(t - t0) * 1.5 / GRIP_SPEED, 0.2),
-                        lambda p: {"T": 106, "cmd": round(p[0], 3), "spd": 0, "acc": GRIP_ACC})
-            return self._settle(lambda: self.read()[3:], 0.01)[0]
-
-    def play(self, points: list, speed: float = DEFAULT_SPEED) -> None:
-        """Visit [x, y, z, t] points in order with go_to (straight lines, gripper interpolated). Every point is checked
-        against the bounds before anything moves, so a path recorded under older, bigger bounds is refused whole."""
-        if not points:
-            raise ValueError("the path is empty")
-        for i, (x, y, z, _) in enumerate(points, 1):
-            try:
-                check_target(self.bounds or {}, x, y, z)
-            except (ValueError, KeyError) as e:
-                raise ValueError(f"point {i} of the path is not allowed: {e or 'no bounds'}") from None
-        with self.lock_:
-            for x, y, z, t in points:
-                self.go_to(x, y, z, speed, min(max(t, GRIP_OPEN), GRIP_CLOSED))
-
-    def perform(self, keys, size: float = 1.0):
-        """Play a gesture: keyframes (secs, dr, da, dz, grip, led) relative to the claw's pose now: dr mm out from the
-        base axis, da degrees of base turn (+ = left), dz mm up, all times `size`; grip (0 shut .. 1 wide) and led
-        (0..255) are absolute, None = as at the start. `keys` may instead be a function (ref (x, y, z), bounds) ->
-        keyframes, for gestures aimed at a place; those ignore `size`. If the path does not fit inside the limits, the
-        claw first slides (facing the same way) up to all the way to the middle of the box's x range and height, and
-        plays it there; only if that does not fit either is it shrunk (0.7, 0.5, 0.35 of the size). Unlike play, it flows
-        through the keyframes without settling at each, and every sample is checked before anything moves. It ends with
-        go_to's sag correction. Returns (measured (x, y, z), size used, mm slid first)."""
-        if not self.bounds:
-            raise RuntimeError("no bounds: draw them first with cli.py")
-        if isinstance(size, bool) or not isinstance(size, (int, float)) or not 0.2 <= size <= 1.5:
-            raise ValueError(f"size {size!r} is not in [0.2, 1.5]")
-        with self.lock_:
-            fb = self._feedback()
-            here = fb["x"], fb["y"], fb["z"]
-            if self.target and math.dist(here, self.target) <= TOLERANCE_MM:  # keep go_to's sag correction going
-                ref, off = self.target, [c - g for c, g in zip(self.commanded, self.target)]
-            else:
-                ref, off = here, (0, 0, 0)
-            slides = (0, .25, .5, .75, 1)
-            if callable(keys):
-                keys, size, slides = keys(ref, self.bounds), 1.0, (0,)  # aimed gestures go where they are aimed
-            opening = min(max((GRIP_CLOSED - fb["t"]) / (GRIP_CLOSED - GRIP_OPEN), 0), 1)
-            start = (math.hypot(*ref[:2]), math.degrees(math.atan2(ref[1], ref[0])), ref[2], opening, self.led_level)
-            mid = (sum(self.bounds["x"]) / 2 - start[0], sum(self.bounds["z"]) / 2 - start[2])
-            error = None
-            for k, f in ((k, f) for k in (1, 0.7, 0.5, 0.35) for f in slides):
-                try:
-                    samples = trajectory(self.bounds, start, keys, size * k, (mid[0] * f, mid[1] * f))
+            await self.wake.get()
+            while True:  # reply; if something new arrives meanwhile, cut the reply off and reply again
+                while not self.wake.empty():
+                    self.wake.get_nowait()
+                self.task = asyncio.create_task(self.reply())
+                news = asyncio.create_task(self.wake.get())
+                await asyncio.wait({self.task, news}, return_when=asyncio.FIRST_COMPLETED)
+                self.task.cancel()  # no-op if it finished
+                [outcome] = await asyncio.gather(self.task, return_exceptions=True)
+                if isinstance(outcome, Exception):  # a bug: show it, and keep the brain alive
+                    show(f"(brain crashed: {outcome!r})", dim=True)
+                if not news.done():
+                    news.cancel()
                     break
-                except ValueError as e:
-                    error = error or e
+
+    async def reply(self) -> None:
+        if not (self.heard or self.notes):
+            return
+        self.gen += 1
+        texts = [{"type": "text", "text": t} for t in self.heard]
+        turn = [{"role": "user", "content": self.results + texts or [{"type": "text", "text": "(no message)"}]}]
+        if self.notes:
+            turn.append({"role": "system", "content": " ".join(self.notes)})
+        taken, did, owed, self.t0 = (len(self.heard), len(self.notes)), [], {}, time.monotonic()
+        try:
+            async with self.client.messages.stream(
+                    model=MODEL, max_tokens=16000, system=self.system, tools=TOOLS, messages=self.history + turn,
+                    output_config={"effort": EFFORT}, cache_control={"type": "ephemeral"}) as stream:
+                async for event in stream:
+                    if event.type == "content_block_stop":  # a whole block: act on it now, before the reply ends
+                        owed |= self.act(event.content_block, did)
+                reply = await stream.get_final_message()
+        except asyncio.CancelledError:
+            if did:
+                self.note("Your last reply was cut off by something new. Before that you had already: "
+                          + "; ".join(did) + ".")
+            log(cut=True, did=len(did), secs=round(time.monotonic() - self.t0, 2))
+            raise
+        except (anthropic.APIError, ValueError) as e:  # ValueError: tool input JSON the SDK could not parse at all
+            show(f"(brain error: {e}. Say something to try again.)", dim=True)
+            if did:
+                self.note("Your last reply failed part way. Before that you had already: " + "; ".join(did) + ".")
+            return
+        del self.heard[:taken[0]], self.notes[:taken[1]]
+        log(first_s=round(self.first - self.t0, 2) if did else None, secs=round(time.monotonic() - self.t0, 2),
+            stop=reply.stop_reason, model=reply.model, **{k: getattr(reply.usage, k) for k in (
+                "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")})
+        if reply.stop_reason == "refusal":  # nothing to send back; don't send the same thing again either
+            self.note(f"Your reply to {[t['text'] for t in texts]} was declined by a safety check.")
+            show("(it declined to answer that)", dim=True)
+            return
+        content = reply.content  # sent back unchanged, thinking blocks included
+        self.history += turn + [{"role": "assistant", "content": content}]
+        self.results = [owed.get(b.id) or {"type": "tool_result", "tool_use_id": b.id, "is_error": True,
+                                           "content": "not done: the reply was cut off"}
+                        for b in content if b.type == "tool_use"]
+        if any(r.get("is_error") for r in self.results):  # a bad tool input: let it try again at once
+            self.note("Some of your tool calls were not done; their results say why.", wake=True)
+
+    def act(self, block, did: list) -> dict:
+        """Run one finished content block: words show now, body actions queue. Returns {tool_use_id: tool_result}."""
+        if block.type == "text" and block.text.strip():  # not meant to happen (words go in `say`), but never lose them
+            self.done(did, f"said {block.text.strip()!r}", f"arm> {block.text.strip()}")
+        if block.type != "tool_use":
+            return {}
+        a = block.input if isinstance(block.input, dict) else {}
+        try:
+            if block.name == "say":
+                if not isinstance(a.get("text"), str):
+                    raise ValueError("text must be a string")
+                self.done(did, f"said {a['text']!r}", f"arm> {a['text']}")
+                result = "shown"
+            elif block.name == "stop":
+                self.body.stop()
+                self.done(did, "stopped moving", "\033[2m  · stop")
+                result = "stopped"
             else:
-                raise ValueError(f"the gesture does not fit here, even moved toward the middle of the box and shrunk to "
-                                 f"{size * k:.2g}x: {error}")
-            self._xyz_mode(fb)
-            t0, led = time.monotonic(), round(self.led_level)
-            for i, (x, y, z, t, level) in enumerate(samples):
-                time.sleep(max(0, t0 + i / RATE_HZ - time.monotonic()))  # clock-timed, like _glide
-                self._send({"T": 1041, "x": round(x + off[0], 1), "y": round(y + off[1], 1), "z": round(z + off[2], 1),
-                            "t": round(t, 3)})
-                if round(level) != led:
-                    led = round(level)
-                    self._send({"T": 114, "led": led})
-            self.led_level = led
-            self.target = samples[-1][:3]
-            aim = tuple(a + o for a, o in zip(self.target, off))
-            now = self._correct(self.target, aim, samples[-1][3], self._settle(lambda: self.read()[:3], 0.5))
-            return now, size * k, math.hypot(mid[0] * f, mid[1] * f)
+                fn = body_action(self.body.arm, block.name, a)
+                label = f"{block.name}({', '.join(f'{v:g}' if isinstance(v, (int, float)) else str(v) for v in a.values())})"
+                self.body.do(self.gen, label, fn)
+                self.done(did, f"queued {label}", f"\033[2m  · {label}")
+                result = "queued"
+            return {block.id: {"type": "tool_result", "tool_use_id": block.id, "content": result}}
+        except (TypeError, ValueError) as e:
+            return {block.id: {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
+                               "content": f"not done: {e}"}}
 
-    def led(self, level: int) -> None:
-        """Gripper LED brightness, 0 (off) .. 255 (full). Tested on the arm 2026-11-07. The arm does not report it back."""
-        if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 255:
-            raise ValueError(f"LED level {level!r} is not an integer in [0, 255]")
-        with self.lock_:
-            self._send({"T": 114, "led": level})
-            self.led_level = level
+    def done(self, did: list, what: str, line: str) -> None:
+        """Show what was just done; the first thing in each reply also shows how long the reply took to get there."""
+        if not did:
+            self.first = time.monotonic()
+            line += f"\033[2m   {self.first - self.t0:.1f} s"
+        did.append(what)
+        show(line + "\033[0m")
 
-    def free(self) -> None:
-        """Torque off: the joints go limp so the arm can be moved by hand. Human use only."""
-        self._send({"T": 210, "cmd": 0})
-        self.target = None
 
-    def lock(self) -> None:
-        """Lock the joints where they are now. A rotation command re-locks them, so command the measured angles."""
-        with self.lock_:
-            b, s, e, h = self.joints()
-            self.target = None
-            self._send({"T": 102, "base": b, "shoulder": s, "elbow": e, "hand": h, "spd": 0, "acc": JOINT_ACC})
-            time.sleep(0.2)
-            fb = self._feedback()
-            if not all(fb[k] for k in ("torswitchB", "torswitchS", "torswitchE", "torswitchH")):
-                self._send({"T": 210, "cmd": 1})  # fallback: plain torque on
+async def idle(brain: Brain) -> None:
+    while True:
+        await asyncio.sleep(5)
+        if not brain.idle_noted and time.monotonic() - brain.last_heard > IDLE_S:
+            brain.idle_noted = True
+            brain.note(f"The person has not written for {IDLE_S // 60} minutes.", wake=True)
 
-    def close(self) -> None:
-        self.ser.close()
+
+async def chat(brain: Brain) -> None:
+    session = PromptSession()
+    while True:
+        try:
+            text = (await session.prompt_async("you> ")).strip()
+        except (KeyboardInterrupt, EOFError):  # Ctrl-C or Ctrl-D: main() stops everything on the way out
+            return
+        if text:
+            brain.hear(text)
+
+
+async def main() -> None:
+    state = load_state()
+    if not state["bounds"]:
+        sys.exit("no bounds in arm_state.json: run `python cli.py` and draw them first")
+    env = Path(__file__).with_name(".env")
+    for line in env.read_text().splitlines() if env.exists() else []:  # KEY=value lines; the shell's own values win
+        key, sep, value = line.partition("=")
+        if sep and not key.strip().startswith("#"):
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit(f"no Claude API key: put it in {env} as ANTHROPIC_API_KEY=...")
+    brain = Brain(anthropic.AsyncAnthropic(), system_prompt(state["bounds"]))
+    print("Connecting. The arm resets and moves to its resting pose: keep clear...")
+    arm = await asyncio.to_thread(Arm, state["bounds"])
+    loop = asyncio.get_running_loop()
+    brain.body = Body(arm, lambda text, wake: loop.call_soon_threadsafe(brain.note, text, wake))
+    brain.note("You have just been switched on, at your resting pose.", wake=True)
+    print("Talk to it. Ctrl-C (or Ctrl-D) stops the arm and quits.")
+    with patch_stdout(raw=True):
+        workers = [asyncio.create_task(brain.run()), asyncio.create_task(idle(brain))]
+        try:
+            await chat(brain)
+        finally:  # the kill switch works without the LLM: cut off the reply first, so it can queue nothing more
+            brain.interrupt()
+            for w in workers:
+                w.cancel()
+            brain.body.stop()
+            await asyncio.sleep(0.2)  # the body thread holds the claw where it is
+            arm.close()
+    print("Stopped: the arm holds where it is.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:  # Ctrl-C while connecting
+        print("\nStopped.")

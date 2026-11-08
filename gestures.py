@@ -9,7 +9,7 @@ Durations keep moves at roughly 100 mm/s or more: slower than that the arm moved
 
 import math
 
-from arm import REACH_MAX_MM, START
+from motion import REACH_MAX_MM, START
 
 
 def K(secs, dr=0, da=0, dz=0, grip=None, led=None):

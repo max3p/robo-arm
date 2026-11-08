@@ -1,2 +1,4 @@
 pyserial>=3.5
 mcp>=2.3
+anthropic>=2.6
+prompt_toolkit>=3.0
