@@ -472,11 +472,14 @@ async def chat(brain: Brain) -> None:
 
 def heard(brain: Brain, kind: str, **info) -> None:
     """What the ears report (on the event loop): shown for debugging, logged, and words go to the brain. Asleep, only
-    speech with its name gets through (and wakes it); the rest is neither shown nor kept."""
+    speech with its name gets through (and wakes it), even what the ears would drop as too short or unsure: a quick
+    "Rob!" is only 0.13-0.29 s of voice. The rest is neither shown nor kept (the log keeps only why the ears would
+    have dropped it, and how long it was)."""
     if kind in ("heard", "dropped") and brain.body.asleep:
-        if kind == "dropped" or not NAME.search(info["text"]):
-            log("dropped", why="asleep")
+        if not NAME.search(info.get("text", "")):
+            log("dropped", why="asleep", ears=info.get("why"), speech_s=info["speech_s"])
             return show("  (asleep: ignored what was said)", dim=True)
+        kind = "heard"
         brain.body.wake()
         brain.note("You were asleep and heard your name: you are waking up.")
     log(kind, **info)
@@ -517,7 +520,8 @@ async def main() -> None:
     arm = await asyncio.to_thread(Arm, state["bounds"])
     brain.body = Body(arm, lambda text, wake: loop.call_soon_threadsafe(brain.note, text, wake),
                       lambda what: loop.call_soon_threadsafe(idling, what))
-    ears = Ears(lambda kind, **info: loop.call_soon_threadsafe(lambda: heard(brain, kind, **info)))  # ready in ~3 s
+    ears = Ears(lambda kind, **info: loop.call_soon_threadsafe(lambda: heard(brain, kind, **info)),  # ready in ~3 s
+                lambda: brain.body.asleep)
     brain.note("You have just been switched on, at your resting pose.", wake=True)
     print(f"Talk to it (or type). Ctrl-C (or Ctrl-D) stops the arm and quits. Log: {RUN}/")
     with patch_stdout(raw=True):

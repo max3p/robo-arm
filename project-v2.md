@@ -489,8 +489,19 @@ or was told to sleep, it hears nothing but its name:
   reply waited: in the user's test, "Rob" then "wake up" 1.5 s later cut `wake_up` mid-stretch and left the claw
   410 mm out for the rest of the conversation.
 - Typed messages still always get through, for debugging.
-- `ears.HOTWORDS` hints the name to Whisper. Without it, a short "Rob" in a fast synthetic voice came out "Hey mom!"
-  or "Rub.".
+- `ears.HOTWORDS` hints the name to Whisper, only while asleep. Without it, a short "Rob" in a fast synthetic voice
+  came out "Hey mom!" or "Rub.".
+- **Made more sensitive (2026-11-07).** The user had to shout the name slowly, several times. The cause: a quick
+  "Rob" is only 0.13-0.29 s of voice, under `MIN_SPEECH_S` (0.3 s), so the ears dropped it as a clunk before
+  transcribing it. The voice detector caught every one, even at 3% volume, and Whisper never misheard one. Now
+  the ears transcribe short sounds too (still dropped when awake), and asleep, the name in *anything* transcribed
+  wakes it, short or unsure. The asleep log line now keeps why the ears would have dropped it, and how long it was
+  (still no text).
+  - Measured on synthetic voices (4 voices, 3 speeds, 2 volumes): the hint catches 95% of short names (74%
+    without), but it also turns 14% of isolated single words ("Rub it.", "Robot.", "Problem.") into "Rob", and
+    for a faint word it can write the hint itself ("Robert, Rob"). Whole sentences never woke it, and no clunk did.
+    So the hint is on only while asleep: awake, chat is transcribed without the bias.
+  - End to end: asleep, a 0.26 s "Rob!" at 300 words per minute woke it; two sentences without the name did not.
 
 **Tested (2026-11-07):**
 - Synthetic speech (espeak, 3 voices) through the ears: 13 phrases each, 7 with the name. With the hint, every

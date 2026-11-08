@@ -4,10 +4,10 @@ turns each one into text locally on the GPU, and arm.py hands the text to the br
     mic (48 kHz, via PipeWire) -> 16 kHz -> Silero voice detector, 32 ms frames -> SILENCE_S of quiet ends it
         -> faster-whisper (STT_MODEL, CUDA) -> report("heard", text=...)
 
-Only what the detector calls speech is ever transcribed: given 3 s of room silence, Whisper wrote "Thank you." (with
+Only what the detector calls speech is ever transcribed (even when it is too short to keep, so a quick name is heard): given 3 s of room silence, Whisper wrote "Thank you." (with
 a no-speech probability of 0.0), so it must never see silence or hum.
 `report(kind, **info)` is called from the ears' own thread with kind "ready", "speech" (someone started talking),
-"heard", "dropped" or "error".
+"heard", "dropped" or "error". `asleep()` says whether the arm sleeps: Whisper is then hinted toward its name.
 """
 
 import ctypes
@@ -26,9 +26,10 @@ STT_MODEL, LANGUAGE = "large-v3-turbo", "en"  # ~1.6 GB, downloaded once to ~/.c
 START_P, END_P = 0.5, 0.35  # the detector's speech probability: speech starts above START_P, ends below END_P
 SILENCE_S = 0.5     # this much quiet ends an utterance
 PREROLL_S = 0.3     # kept from before the start, so the first syllable isn't clipped
-MIN_SPEECH_S = 0.3  # less speech than this (a clunk, a cough) is dropped without transcribing
+MIN_SPEECH_S = 0.3  # less speech than this (a clunk, a cough) is dropped, with its text (arm.py wakes on a name in it)
 MAX_SPEECH_S = 15   # longer speech is cut here, so the brain isn't kept waiting
-HOTWORDS = "Robert, Rob"  # the arm's name (arm.NAME), hinted to Whisper: without it, a short "Rob" came out "Rub"
+HOTWORDS = "Robert, Rob"  # the arm's name (arm.NAME), hinted to Whisper while it sleeps: 95% of short synthetic names
+# were caught with the hint, 74% without. Only then: it also turned 14% of single words ("Rub it.", "Robot.") into "Rob"
 MIN_LOGPROB = -1.0  # Whisper's mean log-probability per word piece: below this it is likely making words up
 
 
@@ -47,8 +48,8 @@ def load_cuda_libs() -> None:
 
 
 class Ears:
-    def __init__(self, report):
-        self.report = report
+    def __init__(self, report, asleep=lambda: False):
+        self.report, self.asleep = report, asleep
         self.audio = queue.Queue()  # 32 ms frames at 16 kHz; None ends listening
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -98,17 +99,18 @@ class Ears:
 
     def utterance(self, audio, voiced_s) -> None:
         info = {"speech_s": round(voiced_s, 2), "clip_s": round(len(audio) / RATE, 2)}
-        if voiced_s < MIN_SPEECH_S:
-            return self.report("dropped", why="too short", **info)
         t = time.monotonic()
         segments, _ = self.whisper.transcribe(audio, language=LANGUAGE, beam_size=1, without_timestamps=True,
-                                              condition_on_previous_text=False, hotwords=HOTWORDS)
+                                              condition_on_previous_text=False,
+                                              hotwords=HOTWORDS if self.asleep() else None)
         segments = list(segments)
         text = "".join(s.text for s in segments).strip()
         info |= {"text": text, "stt_s": round(time.monotonic() - t, 2),
                  "logprob": round(min((s.avg_logprob for s in segments), default=0), 2)}
         if not text:
             self.report("dropped", why="no words", **info)
+        elif voiced_s < MIN_SPEECH_S:  # transcribed all the same: asleep, a quick "Rob!" (0.13-0.29 s) must wake it
+            self.report("dropped", why="too short", **info)
         elif info["logprob"] < MIN_LOGPROB:
             self.report("dropped", why="unsure, likely made up", **info)
         else:
