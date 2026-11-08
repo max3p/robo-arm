@@ -15,6 +15,8 @@ An LLM controls a desk robot arm through tool calls. The tools act in the physic
      transcribes locally on the GPU. The arm answers only with movement.
    - **Phase 2.7 (built, 2026-11-07):** idle life. Between inputs the body fidgets by itself, without the LLM:
      content, then bored, then sleepy, then asleep.
+   - **Phase 2.8 (built, 2026-11-07):** its name is Robert. Asleep, it ignores everything said except "Robert" or
+     "Rob", which wakes it.
 3. **Phase 3 (later):** a camera on the arm and a perception worker that feeds scene information back to the LLM.
 
 ## Quick start
@@ -383,7 +385,7 @@ Blue Snowball (48 kHz, via PipeWire) ─► 16 kHz ─► Silero voice detector 
      -0.04 to -0.45).
 3. **No wake word.** It hears everything, and the system prompt says not all of it is meant for it (TV, phone calls):
    let it go by, or glance over. It's also told words are machine-transcribed and may be misheard: tilt or look
-   confused rather than guess. (Sleep plus a wake word is a future feature, below.)
+   confused rather than guess. (Asleep, only its name wakes it: Phase 2.8, below.)
 4. **The Snowball only opens at 48 kHz through PipeWire,** so every 3 samples are averaged down to 16 kHz.
 5. **The CUDA libraries come from pip** (`nvidia-cublas-cu12`, `nvidia-cudnn-cu12`); `ears.load_cuda_libs` loads
    them, since they are not on the library path.
@@ -466,15 +468,32 @@ static, 2026-11-07.)
 **Not yet checked:** whether it feels right to the user. The timings and fidget lists are knobs at the top of
 `arm.py`.
 
-## Future feature: sleep and a wake word (asked for 2026-11-07, not built)
+## Phase 2.8: asleep, only its name wakes it (built 2026-11-07)
 
-For now the arm listens all the time (Phase 2.6), and every utterance it hears goes to the brain. Later:
-- After some time with nothing said to it, it goes to sleep (the `sleep` gesture; built in Phase 2.7), and the brain
-  stops getting what it hears (not built: it still hears everything).
-- While asleep, the ears listen only for a wake word (its name), locally with no API calls, using a small keyword
-  model (e.g. openWakeWord) or a cheap check of the Whisper transcript.
-- On the wake word it perks up (`wake_up`, then `look_at` the person) and goes back to always listening.
-- What this saves: API calls while nobody is talking to it (TV, phone calls), and it feels like a pet having a nap.
+Its name is **Robert** ("Rob" for short), chosen by the user. Asleep, whether it dozed off from boredom (Phase 2.7)
+or was told to sleep, it hears nothing but its name:
+- Speech is still cut out by the voice detector and transcribed locally, since that is the only way to hear the name.
+  But unless the text has the word "Robert" or "Rob" (`arm.NAME`; not "robot", "problem", "Bob" or "Roberta"), it
+  is dropped: not shown, no text logged (only `dropped`, why "asleep"), and no API call. No perk-up either.
+- On its name, `Body.wake` plays `wake_up` at once, and the brain gets what was said plus a note that it woke. The
+  brain's reply queues after `wake_up` rather than cutting it off, and a `wake_up` the brain asks for itself is
+  skipped (Haiku asked for one anyway, so it played twice).
+- Typed messages still always get through, for debugging.
+- `ears.HOTWORDS` hints the name to Whisper. Without it, a short "Rob" in a fast synthetic voice came out "Hey mom!"
+  or "Rub.".
+
+**Tested (2026-11-07):**
+- Synthetic speech (espeak, 3 voices) through the ears: 13 phrases each, 7 with the name. With the hint, every
+  "Robert" and "Rob" was caught, and "robot", "problem", "Bob" and others weren't; one "Roberta" (British voice)
+  came out "Robert" and would wake it. Without the hint, 2 of the "Rob"s were missed.
+- End to end (real API and Whisper, fake mic and arm): "it is late, go to sleep" gave yawn then sleep. "Did you see
+  the game last night?", "Hey Bob, how was work?" and "The robot is asleep." were ignored, with no API call (4
+  replies in the whole run). "Robert, wake up!" gave `wake_up`, then the brain's `happy`.
+
+**Not checked:** real voices saying "Rob" from across the room.
+
+**Still possible later:** a dedicated wake-word model (e.g. openWakeWord, trained on "Robert") would let Whisper rest
+while it sleeps. For now Whisper runs only on speech (~0.25 s each) and the cost is negligible.
 
 ## Phase 3: camera and perception (do not build yet)
 

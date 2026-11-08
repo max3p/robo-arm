@@ -1,4 +1,2 @@
 todo:
-- audio sleep/wake
-- idle animations and boredom. 
 - camera

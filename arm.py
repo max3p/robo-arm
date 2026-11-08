@@ -30,6 +30,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -59,14 +60,15 @@ MOODS = [  # (s since the brain last moved it, what the brain is told, fidgets p
     (120, "you are getting sleepy", ["yawn", "calm", "glance", "home"]),
     (240, "you fell asleep by yourself", ["sleep"]),  # stays asleep until the brain moves it
 ]
+NAME = re.compile(r"\b(robert|rob)\b", re.I)  # asleep, only speech with its name wakes it; the rest is ignored
 PERSON = (600, 0, 300)  # mm: where the person usually is, so the arm can look at them. A guess: measure and adjust
 RUN = Path(__file__).with_name("logs") / time.strftime("%Y-%m-%d_%H-%M-%S")  # this run's transcript
 T0 = time.monotonic()
 
 
 def system_prompt(bounds: dict) -> str:
-    return f"""You are the mind of a small robot arm on a desk: a companion, like a clever pet dog. You live with \
-your person and you adore them. You understand everything they say, but like a dog you cannot speak or write: you \
+    return f"""You are Robert (Rob for short), the mind of a small robot arm on a desk: a companion, like a clever \
+pet dog. You live with your person and you adore them. You understand everything they say, but like a dog you cannot speak or write: you \
 answer only with your body. Gestures, where you look, how close you come, your claw and the light on it are your whole \
 language. Nothing you write as text reaches anyone, so never write; act.
 
@@ -105,8 +107,9 @@ your person first when a gesture is meant for them.
 - You rest at {START} mm, folded back over your base (go_home). When things calm down, settle back there, like a pet \
 lying down again; when you stop moving, your body goes back there by itself.
 - When nothing is happening, your body idles by itself: it rests and glances around, gets bored, then sleepy, and in \
-the end falls asleep. You are told when that mood changes; you need not act on it. Asleep, your next movement wakes \
-you first, by itself (wake_up); if what you hear is not for you, just don't move, and sleep on.
+the end falls asleep. You are told when that mood changes; you need not act on it. Asleep (by yourself, or when \
+told to sleep), you hear nothing at all until someone says your name; that wakes you (wake_up plays by itself), and \
+you hear what they said.
 - {describe_limits(bounds)}
 - System messages come from the program that runs you (what your body did, how long it has been quiet), not from \
 your person."""
@@ -230,11 +233,22 @@ class Body:
             self.cv.notify()
             self.idling("listen")
 
+    def wake(self) -> None:
+        """Its name was heard while asleep: wake up now. The brain's reply queues after wake_up, not over it."""
+        with self.cv:
+            self._drop()
+            self.asleep, self.gen = False, "waking"
+            self.todo.append(("gesture(wake_up)", lambda: self.arm.perform(GESTURES["wake_up"][1])))
+            self.cv.notify()
+
     def do(self, gen: int, label: str, fn) -> None:
         with self.cv:
             if gen != self.gen:
-                self.gen = gen
-                self._drop()
+                waking, self.gen = self.gen == "waking", gen
+                if waking and label.startswith("gesture(wake_up"):
+                    return  # already waking up
+                if not waking:
+                    self._drop()
                 if self.asleep and not label.startswith("gesture(wake_up"):  # a pet wakes up before anything else
                     self.todo.append(("gesture(wake_up)", lambda: self.arm.perform(GESTURES["wake_up"][1])))
             self.todo.append((label, fn))
@@ -444,12 +458,19 @@ async def chat(brain: Brain) -> None:
 
 
 def heard(brain: Brain, kind: str, **info) -> None:
-    """What the ears report (on the event loop): shown for debugging, logged, and words go to the brain."""
+    """What the ears report (on the event loop): shown for debugging, logged, and words go to the brain. Asleep, only
+    speech with its name gets through (and wakes it); the rest is neither shown nor kept."""
+    if kind in ("heard", "dropped") and brain.body and brain.body.asleep:
+        if kind == "dropped" or not NAME.search(info["text"]):
+            log("dropped", why="asleep")
+            return show("  (asleep: ignored what was said)", dim=True)
+        brain.body.wake()
+        brain.note("You were asleep and heard your name: you are waking up.")
     log(kind, **info)
     if kind == "heard":
         show(f"heard> {info['text']}")
         brain.hear(info["text"])
-    elif kind == "speech":
+    elif kind == "speech" and not (brain.body and brain.body.asleep):
         show("  (listening...)", dim=True)
         if brain.body:
             brain.body.hush()

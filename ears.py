@@ -28,6 +28,7 @@ SILENCE_S = 0.5     # this much quiet ends an utterance
 PREROLL_S = 0.3     # kept from before the start, so the first syllable isn't clipped
 MIN_SPEECH_S = 0.3  # less speech than this (a clunk, a cough) is dropped without transcribing
 MAX_SPEECH_S = 15   # longer speech is cut here, so the brain isn't kept waiting
+HOTWORDS = "Robert, Rob"  # the arm's name (arm.NAME), hinted to Whisper: without it, a short "Rob" came out "Rub"
 MIN_LOGPROB = -1.0  # Whisper's mean log-probability per word piece: below this it is likely making words up
 
 
@@ -101,7 +102,7 @@ class Ears:
             return self.report("dropped", why="too short", **info)
         t = time.monotonic()
         segments, _ = self.whisper.transcribe(audio, language=LANGUAGE, beam_size=1, without_timestamps=True,
-                                              condition_on_previous_text=False)
+                                              condition_on_previous_text=False, hotwords=HOTWORDS)
         segments = list(segments)
         text = "".join(s.text for s in segments).strip()
         info |= {"text": text, "stt_s": round(time.monotonic() - t, 2),
