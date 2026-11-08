@@ -6,7 +6,7 @@ An LLM controls a desk robot arm through tool calls. The tools act in the physic
 
 1. **Phase 1 (done, 2026-11-07):** safe motion primitives (move, nudge, home, gripper, LED, replay a taught path),
    exposed to Claude as an MCP server. A human draws the workspace bounds by hand, and the AI cannot cross them.
-2. **Phase 2 (in progress):** a **catalog of known movements** that make the arm read as a clever companion or pet
+2. **Phase 2 (done, 2026-11-07):** a **catalog of known movements** that make the arm read as a clever companion or pet
    with a personality: body language (nod, shake, curious, happy, excited, sad, startle, sleep, wake_up, look_at),
    exposed to the LLM as tools.
    - **Phase 2.5 (built, 2026-11-07):** `arm.py`, our own terminal chat on the Claude API. You talk to the arm as
@@ -88,9 +88,11 @@ Human ──► arm.py: input ─► brain (Claude API, streaming) ─► body t
          (voice ─► ears.py, or typed)
 ```
 
-The MCP client is the agent; there is no agent loop, LangGraph or API-key handling of our own. The design is split by who is in control:
+Through MCP, the client (Claude Code) is the agent, with no loop of our own. The pet chat `arm.py` (Phase 2.5) is our own
+loop on the Claude API instead, with its API key in `.env`; both drive the same `motion.py`. The design is split by who is
+in control:
 - **The human side** (`cli.py`) does everything that needs a person holding the arm: drawing bounds and teaching paths.
-- **The AI side** (`mcp_server.py`) can only move inside the bounds.
+- **The AI side** (`mcp_server.py`, `arm.py`) can only move inside the bounds.
 
 | File | Role |
 |---|---|
@@ -191,7 +193,8 @@ Other lessons:
 
 ## Known gaps carried into Phase 2
 
-- **No tests or run logs in the repo.** The planned JSONL log of every tool call was never built, and the v1 tests were deleted with the v1 code.
+- **No tests in the repo.** The v1 tests were deleted with the v1 code; Phase 2's tests lived in a scratch folder. Run
+  logs do exist now, for `arm.py` only: `logs/<start time>/transcript.jsonl` (Phase 2.5). The MCP server logs nothing.
 - **The cause of the intermittent 25-35 mm stall is unknown.** If it recurs, log `torS`/`torE` and servo temperature (if the firmware exposes it).
 - **`play` stops at every waypoint** (it settles and sag-corrects at each). Gestures do not: they use `perform`.
 - **`grip` units differ:** the CLI takes radians and the MCP tool takes an opening from 0 to 1.
@@ -301,7 +304,9 @@ cut in. The companion is our own app on the Claude API, so we control the inputs
 6. **Body to brain:**
    - Finished and cut-short actions become notes for the next turn, with the claw position.
    - A refused or failed action wakes the brain at once, even mid-reply, which cuts that reply off and restarts it
-     knowing about the failure.
+     knowing about the failure. A `move_to` outside the box is refused as soon as the call arrives instead, so the
+     reason goes back in its tool result and the reply isn't cut off (added 2026-11-07, after Haiku tried z = 350 and
+     260 for "how tall can you reach?"; the top is 231).
    - ~~After `IDLE_S` (120 s) without a message, the brain is woken once, so it can doze off.~~ Replaced in Phase 2.7
      by idling in the body, with no API calls.
 7. **Safety stays in code.**
@@ -443,8 +448,11 @@ static, 2026-11-07.)
    reply stops them. Only the brain's own movements reset the quiet clock: if it decides speech isn't for it (the
    TV), the boredom carries on.
 3. **Someone starting to talk** (the ears' `speech` event) stops an idle move at once. The arm perks up where it
-   faces, without turning (the user's call): `gestures.listen` leans up to 50 mm forward (less near the box edge) and lifts to near the top of the
-   box, and holds there. The brain's first movement replaces it ~2 s after the person stops. Idling waits `HUSH_S`
+   faces, without turning (the user's call): `gestures.listen` leans out to 50 mm past the resting pose (less near
+   the box edge) and lifts to near the top of the box, and holds there. It is a set distance, not a lean from
+   wherever the claw is: at first it leaned 50 mm further each time, and in a run of questions (one perk per
+   question, no time to go home between) the claw walked out 162, 213, 263, 312 mm. Now it holds 211 mm, and a claw
+   left farther out comes back to it. The brain's first movement replaces it ~2 s after the person stops. Idling waits `HUSH_S`
    (8 s) from the start of speech, then starts again by going home, e.g. after a cough the ears drop. No perk while
    asleep, or while the brain's own movements play. Tested on the real arm (2026-11-07): from a low glance it rose
    from z 137 to 223.
@@ -476,8 +484,10 @@ or was told to sleep, it hears nothing but its name:
   But unless the text has the word "Robert" or "Rob" (`arm.NAME`; not "robot", "problem", "Bob" or "Roberta"), it
   is dropped: not shown, no text logged (only `dropped`, why "asleep"), and no API call. No perk-up either.
 - On its name, `Body.wake` plays `wake_up` at once, and the brain gets what was said plus a note that it woke. The
-  brain's reply queues after `wake_up` rather than cutting it off, and a `wake_up` the brain asks for itself is
-  skipped (Haiku asked for one anyway, so it played twice).
+  brain's replies queue after `wake_up` rather than cutting it off (only `stop` and Ctrl-C cut it), and a `wake_up`
+  the brain asks for itself is skipped (Haiku asked for one anyway, so it played twice). At first only the first
+  reply waited: in the user's test, "Rob" then "wake up" 1.5 s later cut `wake_up` mid-stretch and left the claw
+  410 mm out for the rest of the conversation.
 - Typed messages still always get through, for debugging.
 - `ears.HOTWORDS` hints the name to Whisper. Without it, a short "Rob" in a fast synthetic voice came out "Hey mom!"
   or "Rub.".
@@ -490,7 +500,10 @@ or was told to sleep, it hears nothing but its name:
   the game last night?", "Hey Bob, how was work?" and "The robot is asleep." were ignored, with no API call (4
   replies in the whole run). "Robert, wake up!" gave `wake_up`, then the brain's `happy`.
 
-**Not checked:** real voices saying "Rob" from across the room.
+- The user's own voice (2026-11-07): "go to sleep", then three sentences ignored, then "Rob" woke it. Robert also
+  nodded to "Do you have a name?" and got excited at "is it Rob?".
+
+**Not checked:** "Rob" from across the room.
 
 **Still possible later:** a dedicated wake-word model (e.g. openWakeWord, trained on "Robert") would let Whisper rest
 while it sleeps. For now Whisper runs only on speech (~0.25 s each) and the cost is negligible.

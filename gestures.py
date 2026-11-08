@@ -55,16 +55,18 @@ def look_at(x, y, z):
 
 
 def listen(ref, bounds):
-    """Attentive: without turning, lean up to 50 mm forward (less near the edge of the box) and lift the head up near
-    the top of the box, and stay there. At rest the claw is already near the top, so it mostly leans."""
-    z, r = max(bounds["z"][1] - 10, ref[2]), math.hypot(*ref[:2])
-    for dr in (50, 30, 15, 0):
+    """Attentive: without turning, lean out to 50 mm past the resting pose (less near the edge of the box, or stay
+    out if it doesn't fit) and lift the head up near the top of the box, and stay there. A set distance, not a lean
+    from wherever it is: perking up again and again (2026-11-07) walked the claw out 50 mm each time."""
+    z, r, rest = max(bounds["z"][1] - 10, ref[2]), math.hypot(*ref[:2]), math.hypot(*START[:2])
+    for to in (rest + 50, rest + 30, rest + 15, r):
         try:
-            check_target(bounds, *(c * (r + dr + 5) / r for c in ref[:2]), z)  # 5 mm spare
+            for spare in (-5, 5):  # mm, on whichever side it leans
+                check_target(bounds, *(c * (to + spare) / r for c in ref[:2]), z)
             break
         except ValueError:
             pass
-    return [K(.6, dr=dr, dz=z - ref[2])]
+    return [K(.6, dr=to - r, dz=z - ref[2])]
 
 
 def bounce(times, dr, up, down, da, secs):

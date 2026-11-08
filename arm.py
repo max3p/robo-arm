@@ -15,8 +15,9 @@ Three parts run side by side and talk only through queues, so none waits for ano
 - Body: one thread that owns the arm and plays actions in order. The first body action of a newer reply drops what is
   left of older replies and stops the motion in progress (Arm.abort, within 20 ms). With nothing to do it idles by
   itself, without the brain (no API calls): straight after its last movement it goes back to rest, then fidgets from
-  MOODS that grow from content to bored to sleepy, until it falls asleep (the next movement wakes it first). Someone starting to talk
-  stops an idle move: it perks up and leans forward, and holds there while it listens.
+  MOODS that grow from content to bored to sleepy, until it falls asleep. Asleep, only its name (NAME) gets through,
+  and wakes it; a wake_up is never cut short, the newer actions queue after it. Someone starting to talk stops an
+  idle move: it perks up and leans forward, and holds there while it listens.
 New messages and failed actions wake the brain; finished actions and mood changes are only noted for its next turn.
 The conversation is only ever appended to, never edited: that keeps the prompt cache and Claude's thinking valid.
 
@@ -43,7 +44,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from ears import Ears
 from motion import (DEFAULT_SPEED, GRIP_CLOSED, GRIP_OPEN, MAX_SPEED, MIN_SPEED, START, Arm, Interrupted,
-                    describe_limits, load_state)
+                    check_target, describe_limits, load_state)
 from gestures import GESTURES, listen, look_at
 
 # Speed first: Haiku, at low effort (it thinks less, and skips thinking on simple turns). If it seems too dim, raise
@@ -60,6 +61,7 @@ MOODS = [  # (s since the brain last moved it, what the brain is told, fidgets p
     (120, "you are getting sleepy", ["yawn", "calm", "glance", "home"]),
     (240, "you fell asleep by yourself", ["sleep"]),  # stays asleep until the brain moves it
 ]
+WAKE = "gesture(wake_up)"  # the label of the wake_up action, which nothing but stop cuts short
 NAME = re.compile(r"\b(robert|rob)\b", re.I)  # asleep, only speech with its name wakes it; the rest is ignored
 PERSON = (600, 0, 300)  # mm: where the person usually is, so the arm can look at them. A guess: measure and adjust
 RUN = Path(__file__).with_name("logs") / time.strftime("%Y-%m-%d_%H-%M-%S")  # this run's transcript
@@ -160,7 +162,8 @@ def pause(arm: Arm, secs: float) -> None:
 
 def body_action(arm: Arm, name: str, a: dict):
     """Check a body tool's input now; return what the body thread will run later. Raises ValueError on bad input.
-    The limits are checked by motion.py when it runs, against wherever the claw is by then."""
+    A move_to target outside the box is refused here, so the reason goes back in its tool result (refused later, it
+    woke the brain and cut off the reply still being written). The rest is checked by motion.py when it runs."""
     xyz = lambda: [number(a, k, -1000, 1000) for k in "xyz"]
     speed = lambda: number(a, "speed", MIN_SPEED, MAX_SPEED, DEFAULT_SPEED)
     if name == "gesture":
@@ -173,6 +176,7 @@ def body_action(arm: Arm, name: str, a: dict):
         return lambda: arm.perform(keys)
     if name == "move_to":
         (x, y, z), s = xyz(), speed()
+        check_target(arm.bounds, x, y, z)
         return lambda: arm.go_to(x, y, z, s)
     if name == "go_home":
         s = speed()
@@ -208,12 +212,13 @@ def log(kind: str, **record) -> None:
 
 class Body:
     """Owns the arm, in its own thread. Actions run in order; the first action of a newer reply (a new `gen`) drops
-    what older replies left and stops the one in progress. With nothing to do it idles by itself (MOODS).
+    what older replies left and stops the one in progress (but never a wake_up). With nothing to do it idles by
+    itself (MOODS).
     `report(text, wake)` (a note for the brain) and `idling(text)` (an idle move) are called from this thread."""
 
     def __init__(self, arm: Arm, report, idling):
         self.arm, self.report, self.idling = arm, report, idling
-        self.todo, self.cv, self.gen, self.busy = deque(), threading.Condition(), 0, False
+        self.todo, self.cv, self.gen, self.current = deque(), threading.Condition(), 0, None  # current: the label playing
         self.away = False  # the claw may be away from rest: idling starts by going home
         self.asleep = False  # after the sleep gesture it does not idle until the brain moves it
         self.since, self.mood, self.last = time.monotonic(), -1, None  # when the brain last moved it; idle state
@@ -222,10 +227,11 @@ class Body:
 
     def hush(self) -> None:
         """Someone started talking: like a pet, stop idling (gen None), perk up and lean forward, and hold off
-        idling for HUSH_S. Not while asleep or while the brain's movements play; the brain's next movement replaces it."""
+        idling for HUSH_S. Not while asleep or waking up, or while the brain's movements play; the brain's next
+        movement replaces it."""
         with self.cv:
             self.hushed = time.monotonic()
-            if self.asleep or (self.gen is not None and (self.busy or self.todo)):
+            if self.asleep or self._waking() or (self.gen is not None and (self.current or self.todo)):
                 return
             self._drop()
             self.gen, self.away = None, True  # away: idling starts again by going home
@@ -234,33 +240,40 @@ class Body:
             self.idling("listen")
 
     def wake(self) -> None:
-        """Its name was heard while asleep: wake up now. The brain's reply queues after wake_up, not over it."""
+        """Its name was heard while asleep: wake up now."""
         with self.cv:
             self._drop()
-            self.asleep, self.gen = False, "waking"
-            self.todo.append(("gesture(wake_up)", lambda: self.arm.perform(GESTURES["wake_up"][1])))
-            self.cv.notify()
+            self._wake()
 
     def do(self, gen: int, label: str, fn) -> None:
         with self.cv:
             if gen != self.gen:
-                waking, self.gen = self.gen == "waking", gen
-                if waking and label.startswith("gesture(wake_up"):
-                    return  # already waking up
-                if not waking:
-                    self._drop()
-                if self.asleep and not label.startswith("gesture(wake_up"):  # a pet wakes up before anything else
-                    self.todo.append(("gesture(wake_up)", lambda: self.arm.perform(GESTURES["wake_up"][1])))
-            self.todo.append((label, fn))
-            self.cv.notify()
+                self.gen = gen
+                self._drop()
+                if self.asleep and label != WAKE:  # a pet wakes up before anything else
+                    self._wake()
+            if label != WAKE or not self._waking():  # already waking up: once is enough
+                self.todo.append((label, fn))
+                self.cv.notify()
 
     def stop(self) -> None:
+        """Stop everything now, a wake_up too."""
         with self.cv:
-            self._drop()
+            self._drop(everything=True)
 
-    def _drop(self) -> None:
-        self.todo.clear()
-        if self.busy:
+    def _wake(self) -> None:
+        self.asleep = False
+        self.todo.append((WAKE, lambda: self.arm.perform(GESTURES["wake_up"][1])))
+        self.cv.notify()
+
+    def _waking(self) -> bool:
+        return self.current == WAKE or any(label == WAKE for label, _ in self.todo)
+
+    def _drop(self, everything=False) -> None:
+        """Drop what is queued and stop what is playing, except a wake_up: cut off half way, it left the claw stretched
+        out at the far edge of the box (2026-11-07). Newer actions queue after it instead."""
+        self.todo = deque(a for a in self.todo if a[0] == WAKE and not everything)
+        if self.current and (everything or self.current != WAKE):
             self.arm.abort.set()
 
     def _run(self) -> None:
@@ -270,7 +283,7 @@ class Body:
                     if not self.cv.wait(random.uniform(*IDLE_GAP_S)):
                         self._idle()
                 label, fn = self.todo.popleft()
-                self.busy = True
+                self.current = label
             idle = label.startswith("idle: ")
             try:
                 fn()
@@ -279,8 +292,8 @@ class Body:
                 outcome, wake = "cut short", False
             except Exception as e:  # refused (ValueError) or failed (RuntimeError, serial): the brain hears at once
                 outcome, wake = f"failed: {e}", True
-            with self.cv:  # abort is only ever set while busy, so this leaves it clear for whatever comes next
-                self.busy = False
+            with self.cv:  # abort is only ever set while something plays, so this leaves it clear for whatever comes next
+                self.current = None
                 self.arm.abort.clear()
                 self.asleep = label.startswith(("gesture(sleep", "idle: sleep"))
                 if not idle:
@@ -460,7 +473,7 @@ async def chat(brain: Brain) -> None:
 def heard(brain: Brain, kind: str, **info) -> None:
     """What the ears report (on the event loop): shown for debugging, logged, and words go to the brain. Asleep, only
     speech with its name gets through (and wakes it); the rest is neither shown nor kept."""
-    if kind in ("heard", "dropped") and brain.body and brain.body.asleep:
+    if kind in ("heard", "dropped") and brain.body.asleep:
         if kind == "dropped" or not NAME.search(info["text"]):
             log("dropped", why="asleep")
             return show("  (asleep: ignored what was said)", dim=True)
@@ -470,10 +483,9 @@ def heard(brain: Brain, kind: str, **info) -> None:
     if kind == "heard":
         show(f"heard> {info['text']}")
         brain.hear(info["text"])
-    elif kind == "speech" and not (brain.body and brain.body.asleep):
+    elif kind == "speech" and not brain.body.asleep:
         show("  (listening...)", dim=True)
-        if brain.body:
-            brain.body.hush()
+        brain.body.hush()
     elif kind == "dropped":
         show(f"  (ignored a sound: {info['why']}{': ' + repr(info['text']) if info.get('text') else ''})", dim=True)
     elif kind == "ready":
@@ -501,11 +513,11 @@ async def main() -> None:
     brain = Brain(anthropic.AsyncAnthropic(), system_prompt(state["bounds"]))
     log("start", model=MODEL, effort=EFFORT)
     loop = asyncio.get_running_loop()
-    ears = Ears(lambda kind, **info: loop.call_soon_threadsafe(lambda: heard(brain, kind, **info)))
     print("Connecting. The arm resets and moves to its resting pose: keep clear...")
     arm = await asyncio.to_thread(Arm, state["bounds"])
     brain.body = Body(arm, lambda text, wake: loop.call_soon_threadsafe(brain.note, text, wake),
                       lambda what: loop.call_soon_threadsafe(idling, what))
+    ears = Ears(lambda kind, **info: loop.call_soon_threadsafe(lambda: heard(brain, kind, **info)))  # ready in ~3 s
     brain.note("You have just been switched on, at your resting pose.", wake=True)
     print(f"Talk to it (or type). Ctrl-C (or Ctrl-D) stops the arm and quits. Log: {RUN}/")
     with patch_stdout(raw=True):
