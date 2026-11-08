@@ -519,6 +519,77 @@ or was told to sleep, it hears nothing but its name:
 **Still possible later:** a dedicated wake-word model (e.g. openWakeWord, trained on "Robert") would let Whisper rest
 while it sleeps. For now Whisper runs only on speech (~0.25 s each) and the cost is negligible.
 
+## Phase 2.9: dancing to music, `dance.py` (built 2026-11-08)
+
+Ask it to dance ("Rob, dance to this song!") and the brain calls the `dance` tool. For 30 s the mic goes to a beat
+tracker instead of Whisper (`Ears.tap`): nothing is transcribed and the brain sits it out. Then everything goes back to
+normal, and the brain is told how it went. With no steady beat it does not dance; the failure wakes the brain, which
+can look confused. There is no way to stop it early except typing (a new reply) or Ctrl-C.
+
+- **Beat tracking, numpy only.**
+  - Onsets: the rise in loudness from one 16 ms slice to the next, summed per octave.
+  - Tempo: the autocorrelation of the onsets, scored at 1, 2, 3 and 4 beats, within 60-180 BPM, favouring tempos
+    near 120.
+  - Phase: where a comb of beats lines up best.
+  - Fixes found on synthetic songs (rock, four-on-the-floor, drumless; 72-174 BPM):
+    - Summed flat over frequencies, off-beat hi-hats beat the kick, so it often locked on the off-beat.
+    - Without scoring the multiples, it often picked 1.5 or 2/3 beats.
+    - Without blurring the onsets, beats that fall between two slices lined up badly.
+  - With all three fixes, every tempo and phase was right, to within 15 ms.
+  - Above 140 BPM it bobs on every other beat, on the stronger ones.
+- **Staying in sync.** The dance keeps its own beat clock, re-finds the beat every 0.5 s in the last 8 s, and nudges the
+  clock's speed by up to 10% toward it, so the claw never jumps. Estimates are ignored when they jump to double or half
+  the tempo, or by over a quarter beat (snare instead of kick); without that, songs heard at half tempo drifted
+  ±150 ms. On the fake arm the bottoms of the bobs landed within ±25 ms of each other.
+- **What tells music from everything else** is how well the beat repeats (`MIN_STRENGTH` 0.25):
+  - Music through the real mic: 0.48-0.55.
+  - Speech: up to 0.17. Noise and random knocks: up to 0.12.
+  - Loudness tells nothing: the room alone is about as loud at the mic as music at half volume.
+  - At 20% system volume the song did not get through.
+- **The bob swings the whole arm with the claw level,** as the user asked. They posed it by hand at rest, low (79, 122)
+  and high (214, 230), and the claw is level in all three. The arm's two links were fitted to joint readings at 8 poses
+  (238.9 and 279.9 mm, 0.14 mm rms).
+  - With the forearm held level, the claw moves like the elbow: on a circle around a point a forearm's length ahead of
+    the shoulder. So the dance swings the upper arm from -16° (the high pose) toward -57° (the low pose).
+  - The bottom is as low as the drawn box allows: about -42°, at x 120 (the box starts at x 117.6). The user's low pose
+    is outside the box.
+  - The bob is shallower at faster tempos, to stay under 90% of MAX_SPEED.
+  - On the real arm the claw stayed at 88-92° (90 = level). The bob runs diagonally, down and back: at 70 BPM, 45 mm
+    in height and 83 mm in reach.
+  - The earlier straight-down bob was mostly the elbow, and read as a nod.
+- **Lag.** The claw follows its targets 250-370 ms late (about 330 ms at 100 BPM). It behaves like a fixed delay:
+  servo acceleration from 20 up to 250 changed nothing. So the dance aims `LAG_S` 0.3 s ahead.
+- **First real-song test** (the user, Dancing Queen, ~101 BPM): it found 99 BPM, but the bobs looked slow and late. The
+  smooth wave had no moment to see as the beat, and the claw only swung 14-26 mm of the 37 mm asked.
+  - The bob became a bouncing ball, `1 - |sin|`: a sharp turn at the bottom on the beat, with the same peak speed.
+  - On the real arm, with the song fed straight in (no mic), the bottoms then landed ~65 ms early (spread -127..-3 ms),
+    and the claw swung 27-38 mm.
+  - The mic's delay (10-50 ms, not measured: PortAudio reports 10-30) should bring that to on the beat or just before.
+- **`Arm.follow(pose)`** streams targets made on the fly at 50 Hz, each checked against the box just before it is sent.
+- **Real test (arm, mic, a synthetic 116 BPM song through the speakers at 50%):**
+  - It found 116 BPM and danced 20 s.
+  - All 40 re-checks agreed, despite its own motor noise.
+  - Nothing was transcribed.
+
+- **Dancing while listening (2026-11-08).** Real songs from the user's phone, held to the mic, mostly failed the old
+  test: listen 6 s, then dance only at strength 0.25 or more. Their strengths were 0.11-0.22, yet the guessed tempos
+  were often right (101 BPM for Dancing Queen at 0.11). Phone-like synthetic audio (band-passed 350 Hz-7 kHz,
+  squashed) still scored 0.3-0.7, so the synthetic songs are too clean to tune the threshold with. So, as the user
+  suggested, it no longer judges one guess:
+  - It listens 3 s, then dances on its first guess, and guesses again every 0.5 s from the last 6 s.
+  - The tempo is the one the last 12 guesses vote for, weighted by strength. Double or half tempo count as the same
+    tempo, since they make the same bobs.
+  - It changes tempo only when outvoted 1.5:1. Without that, a drumless song flipped between 119 and 80 BPM.
+  - The phase is the agreeing guesses' beats averaged on a circle, so a kick and a snare cannot pull it both ways.
+  - The bob's depth follows how much the guesses agree: from 30% (speech or noise, so the bob is shallow and wanders)
+    to full at a confidence of 0.15.
+  - It no longer refuses at all, except with the ears off.
+  - A crash in one real dance: an interpolation step could throw the beat period negative. It is now clamped.
+  - Fake arm, synthetic audio:
+    - Phone-like songs at 92-158 BPM locked within 1-3 bobs, landing 20-50 ms early (as aimed).
+    - 5 s of talking and then music: it started at a wrong 97 BPM, and was on the beat within 4 bobs.
+    - Speech only: it bobbed 10-18 mm, wandering.
+
 ## Phase 3: camera and perception (do not build yet)
 
 - A camera mounted on the arm. A perception worker (a thread or process) owns the camera, runs open-vocabulary detectors

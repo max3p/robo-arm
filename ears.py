@@ -8,6 +8,7 @@ Only what the detector calls speech is ever transcribed (even when it is too sho
 a no-speech probability of 0.0), so it must never see silence or hum.
 `report(kind, **info)` is called from the ears' own thread with kind "ready", "speech" (someone started talking),
 "heard", "dropped" or "error". `asleep()` says whether the arm sleeps: Whisper is then hinted toward its name.
+While `tap()` is on (dancing), the raw frames go to its queue instead: no detector, no Whisper, nothing is heard.
 """
 
 import ctypes
@@ -51,10 +52,16 @@ class Ears:
     def __init__(self, report, asleep=lambda: False):
         self.report, self.asleep = report, asleep
         self.audio = queue.Queue()  # 32 ms frames at 16 kHz; None ends listening
+        self.tapped = None  # a queue while tap() is on
         threading.Thread(target=self._run, daemon=True).start()
 
     def close(self) -> None:
         self.audio.put(None)
+
+    def tap(self, on: bool):
+        """Send the raw frames to a new queue instead of transcribing them (on), or go back to listening (off)."""
+        self.tapped = queue.Queue() if on else None
+        return self.tapped
 
     def _run(self) -> None:
         try:
@@ -82,6 +89,11 @@ class Ears:
         before = deque(maxlen=round(PREROLL_S * RATE / FRAME))
         speech = None  # the frames of the utterance in progress
         for frame in frames:
+            if (tapped := self.tapped) is not None:
+                tapped.put(frame)
+                speech = None
+                before.clear()
+                continue
             p, h, c = self.vad.run(None, {"input": np.concatenate([context, frame])[None], "h": h, "c": c})
             p, context = p[0], frame[-64:]
             if speech is None:

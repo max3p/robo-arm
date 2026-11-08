@@ -9,6 +9,9 @@ reacts, and it answers only with body language: nods, head tilts, a play bow, le
 - **Has a life of its own:** between conversations it glances around, gets bored, then sleepy, and falls asleep.
   This runs locally, with no API calls.
 - **Asleep, it ignores everything except its name:** "Robert" or "Rob" wakes it.
+- **Dances to music:** "Rob, dance to this song!" makes it listen for 3 s, then bob to the beat for 30 s, the whole
+  arm bouncing with the claw level. It keeps listening as it dances and settles on the tempo it hears most, bobbing
+  gently while unsure and deeper once sure. Play the music loud, close to the mic.
 - **Stays in a safe box:** a person draws the space the arm may use by hand, and every move is checked against it
   in code before the arm moves.
 
@@ -54,6 +57,7 @@ use. The bounds are saved to `arm_state.json`.
 |---|---|
 | [arm.py](arm.py) | The pet. The brain (Claude, streaming tool calls) and the body thread (actions, idling, moods, sleep). Settings at the top: `MODEL`, `MOODS`, `NAME`, `PERSON` |
 | [ears.py](ears.py) | Speech in. The mic, a voice detector and Whisper on the GPU |
+| [dance.py](dance.py) | Dancing: finds the beat in what the mic hears and bobs the arm to it |
 | [gestures.py](gestures.py) | Body language as keyframes: nod, shake, happy, lean_in, sleep, wake_up, look_at and more |
 | [motion.py](motion.py) | Safe motion on the arm: straight-line moves, sag correction, gestures, stopping within 20 ms. All limits are checked here |
 | [cli.py](cli.py) | Human control: draw the bounds, record and play paths, try gestures |

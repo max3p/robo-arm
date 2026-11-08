@@ -373,6 +373,31 @@ class Arm:
             now = self._correct(self.target, aim, samples[-1][3], self._settle(lambda: self.read()[:3], 0.5))
             return now, size * k, math.hypot(mid[0] * f, mid[1] * f)
 
+    def follow(self, pose) -> None:
+        """Stream targets made on the fly: pose(secs since the start) -> (x, y, z, t, led), or None to end. For motion
+        that follows something live (the beat of music), so it cannot be planned ahead like perform; each target is
+        checked against the bounds just before it is sent. pose must start and end at the claw's position, and move
+        smoothly between. Straight after a go_to it keeps that move's sag correction."""
+        with self.lock_:
+            self._xyz_mode(self._feedback())
+            off = [c - g for c, g in zip(self.commanded, self.target)] if self.target and self.commanded else (0, 0, 0)
+            t0, i, led = time.monotonic(), 0, round(self.led_level)
+            try:
+                while (p := pose(time.monotonic() - t0)) is not None:
+                    x, y, z, t, level = p
+                    check_target(self.bounds, x, y, z)
+                    self._check_abort()
+                    self._send({"T": 1041, "x": round(x + off[0], 1), "y": round(y + off[1], 1),
+                                "z": round(z + off[2], 1), "t": round(t, 3)})
+                    if round(level) != led:
+                        led = round(level)
+                        self._send({"T": 114, "led": led})
+                    i += 1
+                    time.sleep(max(0, t0 + i / RATE_HZ - time.monotonic()))
+            finally:  # put the light back as it was
+                self._send({"T": 114, "led": round(self.led_level)})
+                self.target = None  # the next move starts from the measured pose
+
     def led(self, level: int) -> None:
         """Gripper LED brightness, 0 (off) .. 255 (full). Tested on the arm 2026-11-07. The arm does not report it back."""
         if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 255:

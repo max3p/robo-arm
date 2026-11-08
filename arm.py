@@ -18,6 +18,7 @@ Three parts run side by side and talk only through queues, so none waits for ano
   MOODS that grow from content to bored to sleepy, until it falls asleep. Asleep, only its name (NAME) gets through,
   and wakes it; a wake_up is never cut short, the newer actions queue after it. Someone starting to talk stops an
   idle move: it perks up and leans forward, and holds there while it listens.
+Dancing (dance.py) hands the mic to a beat tracker for 30 s instead: nothing is transcribed and the brain sits it out.
 New messages and failed actions wake the brain; finished actions and mood changes are only noted for its next turn.
 The conversation is only ever appended to, never edited: that keeps the prompt cache and Claude's thinking valid.
 
@@ -42,6 +43,7 @@ import anthropic
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 
+from dance import DANCE_S, dance
 from ears import Ears
 from motion import (DEFAULT_SPEED, GRIP_CLOSED, GRIP_OPEN, MAX_SPEED, MIN_SPEED, START, Arm, Interrupted,
                     check_target, describe_limits, load_state)
@@ -143,6 +145,9 @@ TOOLS = [
     tool("light", "The light on the claw: brightness 0 = off .. 1 = full, after `blinks` quick flashes (default 0).",
          ["brightness"], brightness=num("0-1"), blinks={"type": "integer", "description": "0-10"}),
     tool("wait", "Pause between movements.", ["seconds"], seconds=num("0-30")),
+    tool("dance", f"Dance to the music playing: listens for its beat for a few seconds, then bobs and sways to it for "
+         f"{DANCE_S} s, following the beat as it goes (gently while it is unsure). Meanwhile you hear nothing; you are "
+         "told how it went."),
     tool("stop", "Stop moving now and drop the movements still queued."),
 ]
 
@@ -160,7 +165,7 @@ def pause(arm: Arm, secs: float) -> None:
         raise Interrupted("interrupted")
 
 
-def body_action(arm: Arm, name: str, a: dict):
+def body_action(arm: Arm, name: str, a: dict, ears=None):
     """Check a body tool's input now; return what the body thread will run later. Raises ValueError on bad input.
     A move_to target outside the box is refused here, so the reason goes back in its tool result (refused later, it
     woke the brain and cut off the reply still being written). The rest is checked by motion.py when it runs."""
@@ -194,6 +199,10 @@ def body_action(arm: Arm, name: str, a: dict):
                 pause(arm, 0.15)
             arm.led(level)
         return light
+    if name == "dance":
+        if ears is None:
+            raise ValueError("you cannot hear: the ears are off")
+        return lambda: dance(arm, ears, show)
     if name == "wait":
         secs = number(a, "seconds", 0, 30)
         return lambda: pause(arm, secs)
@@ -218,6 +227,7 @@ class Body:
 
     def __init__(self, arm: Arm, report, idling):
         self.arm, self.report, self.idling = arm, report, idling
+        self.ears = None  # for dance; set once the ears exist
         self.todo, self.cv, self.gen, self.current = deque(), threading.Condition(), 0, None  # current: the label playing
         self.away = False  # the claw may be away from rest: idling starts by going home
         self.asleep = False  # after the sleep gesture it does not idle until the brain moves it
@@ -286,8 +296,8 @@ class Body:
                 self.current = label
             idle = label.startswith("idle: ")
             try:
-                fn()
-                outcome, wake = "done", False
+                said = fn()
+                outcome, wake = f"done: {said}" if isinstance(said, str) else "done", False
             except Interrupted:
                 outcome, wake = "cut short", False
             except Exception as e:  # refused (ValueError) or failed (RuntimeError, serial): the brain hears at once
@@ -438,7 +448,7 @@ class Brain:
                 self.done(did, "stopped moving", "arm> stop")
                 result = "stopped"
             else:
-                fn = body_action(self.body.arm, block.name, a)
+                fn = body_action(self.body.arm, block.name, a, self.body.ears)
                 label = f"{block.name}({', '.join(f'{v:g}' if isinstance(v, (int, float)) else str(v) for v in a.values())})"
                 self.body.do(self.gen, label, fn)
                 self.done(did, f"queued {label}", f"arm> {label}")
@@ -522,6 +532,7 @@ async def main() -> None:
                       lambda what: loop.call_soon_threadsafe(idling, what))
     ears = Ears(lambda kind, **info: loop.call_soon_threadsafe(lambda: heard(brain, kind, **info)),  # ready in ~3 s
                 lambda: brain.body.asleep)
+    brain.body.ears = ears
     brain.note("You have just been switched on, at your resting pose.", wake=True)
     print(f"Talk to it (or type). Ctrl-C (or Ctrl-D) stops the arm and quits. Log: {RUN}/")
     with patch_stdout(raw=True):
