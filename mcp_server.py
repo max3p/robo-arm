@@ -12,12 +12,14 @@ import functools
 import math
 import sys
 import time
+from typing import Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from arm import (BASE_KEEPOUT_MM, DEFAULT_SPEED, HOME, MAX_SPEED, MIN_SPEED, GRIP_CLOSED, GRIP_OPEN, REACH_MAX_MM,
                  REACH_MIN_MM, TOLERANCE_MM, Arm, load_state)
+from gestures import GESTURES, look_at as look_keys
 
 
 STATE = load_state()
@@ -33,6 +35,9 @@ LIMITS = (f"Hard limits (mm; origin at the shoulder pivot; x forward, y left, z 
 INSTRUCTIONS = (f"Controls a real 4-DOF desk robot arm (Waveshare RoArm-M2-S) that moves its claw in straight lines. "
                 f"{LIMITS} Bounds drawn by a human on {STATE['bounds_drawn']}; you cannot change them. "
                 f"Saved movements (play them by name): {', '.join(PATHS) or 'none'}. "
+                "It is meant to act like a pet: use `gesture` and `look_at` to react with body language. "
+                "Gestures play wherever the claw is and facing, so chain them with look_at and moves: e.g. look_at a "
+                "person, curious, turn the other way, nod. "
                 "Every result reports the measured pose. When a move is refused, pick a target inside the limits "
                 "instead of repeating it. Moves block until the arm has settled.")
 
@@ -129,6 +134,23 @@ def gripper(opening: float) -> dict:
         raise ValueError(f"opening {opening!r} is not in [0, 1]")
     arm().gripper(GRIP_CLOSED - opening * (GRIP_CLOSED - GRIP_OPEN))
     return pose()
+
+
+@tool("Body language. " + "; ".join(f"{n}: {m}" for n, (m, _) in GESTURES.items())
+      + f". All but sleep and wake_up end where they started. `size` (0.2-1.5, default 1) scales the motion of those;"
+      " a gesture that does not fit where the claw is first slides it (facing the same way) toward the middle of the box,"
+      " and only then shrinks it, down to 0.35x; the result gives size_used and slid_mm.")
+def gesture(name: Literal[tuple(GESTURES)], size: float = 1) -> dict:
+    _, used, slid = arm().perform(GESTURES[name][1], size)
+    return pose() | {"size_used": round(used, 2), "slid_mm": round(slid)}
+
+
+@tool("Turn to face the point (x, y, z) mm, like looking at it: the base turns toward it and the claw moves half way "
+      "to its height, then perks up slightly. It does not reach for it (use move_to for that) and stays facing it. "
+      "The point itself may be outside the limits; if the turn does not fit it turns part of the way.")
+def look_at(x: float, y: float, z: float) -> dict:
+    _, used, _ = arm().perform(look_keys(x, y, z))
+    return pose() | {"turned_fraction": round(used, 2)}
 
 
 @tool(f"Play a movement a human taught by hand, by name. Saved: {', '.join(PATHS) or 'none'}. "

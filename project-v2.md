@@ -6,8 +6,9 @@ An LLM controls a desk robot arm through tool calls. The tools act in the physic
 
 1. **Phase 1 (done, 2026-11-07):** safe motion primitives (move, nudge, home, gripper, LED, replay a taught path),
    exposed to Claude as an MCP server. A human draws the workspace bounds by hand, and the AI cannot cross them.
-2. **Phase 2 (next):** a growing **catalog of known movements** (skills) such as wave, nod, point and rock-paper-scissors,
-   exposed to the LLM as extra tools.
+2. **Phase 2 (in progress):** a **catalog of known movements** that make the arm read as a clever companion or pet
+   with a personality: body language (nod, shake, curious, happy, sad, startle, wave, shrug, sleep, wake_up, look_at),
+   exposed to the LLM as tools.
 3. **Phase 3 (later):** a camera on the arm and a perception worker that feeds scene information back to the LLM.
 
 ## Quick start
@@ -75,8 +76,9 @@ The MCP client is the agent; there is no agent loop, LangGraph or API-key handli
 
 | File | Role |
 |---|---|
-| `arm.py` | Motion API: `Arm.go_to` (straight-line, safety-checked, sag-corrected), `gripper`, `play(points)`, `led`, `read`, `free`, `lock`; `check_target`; `load_state`/`save_state`; all tuned constants with the measurements behind them. **Never prints or prompts**: stdout carries the MCP protocol |
-| `cli.py` | Human REPL. Commands: `read`, `move`, `grip` (radians), `home`, `led`, `bounds` (free the arm and sweep the claw; samples every 100 ms; the min/max becomes the box), `trace` (show the 6 faces of the box), `record NAME` (Enter per point, q to save; one point = a pose), `play NAME`, `paths`, `delete NAME`. Ctrl-C stops motion |
+| `arm.py` | Motion API: `Arm.go_to` (straight-line, safety-checked, sag-corrected), `gripper`, `play(points)`, `led`, `read`, `free`, `lock`; `perform(keys, size)` plays a gesture (see below); `check_target`; `load_state`/`save_state`; all tuned constants with the measurements behind them. **Never prints or prompts**: stdout carries the MCP protocol |
+| `cli.py` | Human REPL. Commands: `read`, `move`, `grip` (radians), `home`, `led`, `bounds` (free the arm and sweep the claw; samples every 100 ms; the min/max becomes the box), `trace` (show the 6 faces of the box), `record NAME` (Enter per point, q to save; one point = a pose), `play NAME`, `gesture NAME [size]`, `look x y z`, `paths`, `delete NAME`. Ctrl-C stops motion |
+| `gestures.py` | The gestures as data: keyframes `K(secs, dr, da, dz, grip, led)` relative to the current pose (dr out from the base axis, da degrees of base turn, dz up), plus functions for the aimed ones (`sleep`, `wake_up`, `look_at`) and `ready(bounds)`, a pose with room for all of them |
 | `mcp_server.py` | AI tools (see below). The bounds are frozen at startup and the port opens lazily on the first tool call. `ValueError`/`RuntimeError` become `ToolError`, so the model sees the real reason plus the current pose |
 | `arm_state.json` | `{"bounds": {"x": [lo, hi], "y": .., "z": ..}, "bounds_drawn": iso, "paths": {name: [[x, y, z, t], ..]}}`. Current box: x 117.6-478.4, y -102.4-368.1, z -102-231.4 |
 
@@ -92,6 +94,8 @@ The MCP client is the agent; there is no agent loop, LangGraph or API-key handli
 | `gripper(opening)` | 0..1. It stops short on an object, and the result shows where it ended |
 | `light(brightness, blinks=0)` | LED from 0 to 1, with optional blinks first |
 | `play(name, speed=300)` | Replays a hand-taught path from `arm_state.json` |
+| `gesture(name, size=1)` | Body language, by name (an enum in the schema; the description says what each means). Relative ones play wherever the claw is and end where they started; `size` 0.2-1.5. If one does not fit it first slides toward the middle of the box, then shrinks (down to 0.35x); the result gives `size_used` and `slid_mm` |
+| `look_at(x, y, z)` | Turns the base to face a point and moves half way to its height, then a small perk. Stays facing it; turns part way if the full turn does not fit |
 
 The bounds reach the model before it acts in three ways: in the server instructions, in every motion tool's description, and from `workspace()`.
 
@@ -107,6 +111,9 @@ The bounds reach the model before it acts in three ways: in the server instructi
   The box is convex, so a straight line between two points inside it stays inside it.
 - **Paths replay in Cartesian space** as straight lines between recorded points, so they also stay inside the box.
   A path with any point outside the current box is refused whole. (Joint-space replay was dropped because it can bulge out of the box.)
+- **Gestures go through `Arm.perform`**, which samples the whole path at 50 Hz (cylindrical interpolation, so a base turn is an
+  arc) and checks every sample against the box, reach and keep-out before anything moves. It keeps `go_to`'s sag correction
+  as a constant offset and corrects again at the end, so repeated gestures do not sink. Segments are stretched to stay under 500 mm/s.
 - **Speed is 100-500 mm/s peak**, with smoothstep easing at both ends, for both the CLI and the AI.
 - **Sag correction:** after settling, `go_to` aims past the target by the miss. The push is capped at 25 mm, with up to 2 passes.
   The *aim point* may be up to 25 mm outside the box; the claw itself ends inside it.
@@ -165,7 +172,7 @@ Other lessons:
 
 - **No tests or run logs in the repo.** The planned JSONL log of every tool call was never built, and the v1 tests were deleted with the v1 code.
 - **The cause of the intermittent 25-35 mm stall is unknown.** If it recurs, log `torS`/`torE` and servo temperature (if the firmware exposes it).
-- **`play` stops at every waypoint.** Each segment eases to zero speed, so multi-point gestures look segmented, not flowing.
+- **`play` stops at every waypoint** (it settles and sag-corrects at each). Gestures do not: they use `perform`.
 - **`grip` units differ:** the CLI takes radians and the MCP tool takes an opening from 0 to 1.
 - **The box never expires.** If the arm or the table moves, the box is stale; only `bounds_drawn` hints at its age.
 
@@ -175,16 +182,31 @@ What Phase 1 already gives:
 - A skill can be a named path in `arm_state.json`, taught by hand (`record NAME`) and run with `play(name)`.
 - Every point is bounds-checked before the arm moves.
 
+**Progress (2026-11-07):** items 1 and 4 below are built: `Arm.perform` and `gestures.py`, nine gestures (nod, shake,
+curious, happy, excited, sad, startle, sleep, wake_up) plus `look_at`, as the `gesture` and `look_at` MCP tools and CLI
+commands. The user reviewed every gesture on the arm; one round of tuning followed (deeper and faster nod, faster shake,
+longer curious lean, lower moping sad, sleep folded down and back, higher and straighter wake_up stretch, new excited;
+wave and shrug were dropped because a 4-DOF arm with no wrist cannot make them read).
+Measured on the arm after tuning (claw sampled at 12.5 Hz during each gesture):
+- Every gesture ended within 0.5-3.6 mm of where it started, thanks to the sag correction at the end of `perform`
+  (before it, a nod ended 13 mm low).
+- The claw lags the stream by up to ~75 mm in fast gestures (98 mm in a fast `look_at` turn) and covers ~85 % of the
+  commanded vertical swing in a fast nod (67 of 80 mm); the slow ones track closely (sad and sleep lag 22-28 mm).
+  So fast gestures need about 15-20 % extra amplitude to look the size they were designed at.
+- Gestures play from any pose. If one does not fit, the claw first slides (same direction) toward the middle of the box,
+  then it shrinks. Turned far left (y ~ 300) the curious lean and the turns shrank to 0.7x: that corner is tight.
+- Not yet checked by eye: whether the slowest parts (sad's mope at ~70-130 mm/s) look stepped, and LED lag.
+
 What Phase 2 should add, roughly in order:
 
-1. **Smooth multi-point motion.** Blend through waypoints instead of stopping at each one, for example a Catmull-Rom spline
+1. **Smooth multi-point motion (built as `perform`; `play` could use it too).** Blend through waypoints instead of stopping at each one, for example a Catmull-Rom spline
    streamed at 50 Hz with easing only at the ends. Gestures like wave and nod depend on this.
    Each blended segment must still be bounds-safe. Spline overshoot can leave the box, so check the sampled curve, not only the points.
 2. **Skill metadata.** Give each path a plain-English `description` (which becomes what the model reads), a `status`
    (`draft`/`approved`) and a version. Keep them in `arm_state.json`, or in a `skills/` folder if it grows.
 3. **Per-skill tools, or a better `play` description.** For a handful of skills, list each name and description in `play`'s
    tool description. Register separate tools only if that helps the model. Past a few dozen, retrieve by embedding.
-4. **Relative / parameterized skills in code.** `wave`, `nod` and `point_at(x, y, z)` should run around the *current* pose
+4. **Relative / parameterized skills in code (built: `gestures.py`).** `wave`, `nod` and `point_at(x, y, z)` should run around the *current* pose
    (built on `go_to` / `move_by`), not at fixed recorded coordinates. Timing-critical skills such as rock-paper-scissors
    (gripper open, half, shut) must be deterministic code; the LLM only chooses *when* to run them. The LED fits here as a signal.
 5. **LLM-proposed skills.** A `save_movement(name, points, description)` tool saves as `draft`. A human dry-runs it and approves it in
@@ -193,7 +215,7 @@ What Phase 2 should add, roughly in order:
 7. **Tooling worth adding along the way:** the fake serial class as `tests/`, and a JSONL log of tool calls and results.
 
 Rules that carry over:
-- Skills only call primitives, so every move still goes through `go_to`'s checks.
+- Skills only call primitives, so every move still goes through the checks in `go_to` or `perform`.
 - Use measured results, not assumptions: test every new motion pattern on the arm and record the numbers here.
 
 ## Phase 3: camera and perception (do not build yet)

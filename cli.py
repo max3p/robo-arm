@@ -12,6 +12,8 @@
         record NAME             free the arm; Enter saves a point (must be inside the box), q + Enter stops and saves
                                 the path as NAME. One point = a named pose. The AI can play saved paths.
         play NAME[, speed]      replay a path in straight lines, speed in mm/s
+        gesture NAME[, size]    body language (nod, shake, curious, happy, excited, sad, startle, sleep, wake_up)
+        look(x, y, z)           turn to face a point
         paths                   list the saved paths
         delete NAME             remove a saved path
 
@@ -23,6 +25,7 @@ import select
 import sys
 
 from arm import GRIP_CLOSED, HOME, MAX_SPEED, Arm, check_target, load_state, now_iso, save_state
+from gestures import GESTURES, look_at
 
 SAMPLE_S = 0.1   # the bounds sweep samples the claw position this often
 MIN_BOX_MM = 20  # a bounds sweep that spans less than this on any axis is rejected as a mistake
@@ -125,7 +128,7 @@ def main() -> None:
             except ValueError as e:
                 print("error:", e)
         print("Commands: read | move(x, y, z[, speed]) | grip(t) | home | led(n) | bounds | trace[(speed)] | record NAME | "
-              "play NAME[, speed] | paths | delete NAME    Ctrl-C quits and stops any move")
+              "play NAME[, speed] | gesture NAME[, size] | look(x, y, z) | paths | delete NAME    Ctrl-C quits and stops any move")
         while True:
             cmd, *args = input("arm> ").replace("(", " ").replace(")", " ").replace(",", " ").split() or [""]
             try:
@@ -150,6 +153,12 @@ def main() -> None:
                         raise ValueError(f"no path '{args[0]}'; saved: {', '.join(state['paths']) or 'none'}")
                     arm.play(state["paths"][args[0]], *map(float, args[1:]))
                     print("done")
+                elif cmd == "gesture" and len(args) in (1, 2):
+                    if args[0] not in GESTURES:
+                        raise ValueError(f"no gesture '{args[0]}'; there are: {', '.join(GESTURES)}")
+                    print("final x=%.1f y=%.1f z=%.1f" % arm.perform(GESTURES[args[0]][1], *map(float, args[1:]))[0])
+                elif cmd == "look" and len(args) == 3:
+                    print("final x=%.1f y=%.1f z=%.1f" % arm.perform(look_at(*map(float, args)))[0])
                 elif cmd == "paths" and not args:
                     for name, points in state["paths"].items():
                         print(f"  {name}: {len(points)} points")

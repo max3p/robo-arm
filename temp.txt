@@ -1,6 +1,28 @@
-arm> record
-Torque goes OFF and the arm will sag under its own weight. Support it, then press Enter...
-rec[0]>            <- move the arm by hand, press Enter to save the pose
-  point 1: x=.. y=.. z=..
-rec[1]> q          <- q + Enter stops; the arm locks where it is
-arm> play(15)      <- replay once at 15 deg/s (default 20, capped at 45)
+Gesture Notes:
+
+GESTURES = {  # name: (what it says, keyframes)
+    "nod": ("yes, agreeing, 'got it': two dips", [K(.3, dr=5, dz=-22), K(.25, dz=3), K(.3, dr=5, dz=-22), K(.4)]),
+    "shake": ("no, disagreeing, 'not that': the base turns left and right",
+              [K(.3, da=7), K(.45, da=-7), K(.4, da=5), K(.35, da=-3), K(.3)]),
+    "curious": ("'what's that?': leans forward, pauses, pulls back a little, leans in closer with the claw parted",
+                [K(.7, dr=45, dz=-15), K(.6, dr=45, dz=-15), K(.3, dr=25, dz=-5), K(.5, dr=25, dz=-5),
+                 K(.7, dr=75, dz=-25, grip=.3), K(.9, dr=75, dz=-25, grip=.3), K(1.0)]),
+    "happy": ("praise, success, someone arrives: bouncy wiggle up high, claw snapping, light flashing",
+              [K(.3, dz=25, da=6, grip=.5, led=255), K(.25, dz=25, da=-6, grip=0, led=0),
+               K(.25, dz=25, da=6, grip=.5, led=255), K(.25, dz=25, da=-6, grip=0, led=0), K(.4)]),
+    "sad": ("told off, a failure, 'aww': sinks and pulls back, claw shuts, light dims; holds, then recovers",
+            [K(1.0, dr=-25, dz=-60, grip=0, led=20), K(1.2, dr=-25, dz=-60, grip=0, led=20), K(1.2)]),
+    "startle": ("sudden noise or poke: fast recoil back and up, freezes, then edges back",
+                [K(.25, dr=-60, dz=35, grip=.6, led=255), K(.7, dr=-60, dz=35, grip=.6, led=255),
+                 K(.6, dr=-25, dz=15, grip=.2), K(.5, dr=-25, dz=15, grip=.2), K(.45)]),
+    "wave": ("hello or goodbye: rises with the claw open and turns side to side",
+             [K(.6, dr=-20, dz=60, grip=1), K(.35, dr=-20, dz=60, da=10, grip=1), K(.45, dr=-20, dz=60, da=-10, grip=1),
+              K(.45, dr=-20, dz=60, da=10, grip=1), K(.35, dr=-20, dz=60, grip=1), K(.6)]),
+    "shrug": ("'I don't know': quick lift with the claw half open, pause, drop",
+              [K(.3, dz=30, grip=.7), K(.5, dz=30, grip=.7), K(.4)]),
+    "sleep": ("long idle, 'goodnight': curls down to a low rest, light breathes, then goes dark. Stays there", sleep),
+    "wake_up": ("start of a session, called by name: stirs, stretches up with a wide-open yawn while the light comes up, "
+                "then settles at the ready pose", wake_up),
+}
+
+

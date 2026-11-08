@@ -4,7 +4,9 @@ This module never prints or prompts: in the MCP server, stdout carries the proto
 The bounds box and the named paths live in arm_state.json. Only cli.py writes that file (the bounds are drawn by hand);
 the MCP server reads it once at startup and cannot change it.
 
-Every move goes through go_to(): a straight line, refused before anything is sent if the target is outside the box, out
+Gestures (gestures.py) go through perform(): keyframes relative to the current pose, flowing without stops, every
+20 ms sample checked against the same limits before anything moves.
+Every other move goes through go_to(): a straight line, refused before anything is sent if the target is outside the box, out
 of reach, or the path passes too close to the base. The box is convex, so a straight line between two points inside it
 stays inside it. The box limits the claw TIP only, not the elbow or forearm: draw it smaller than the real free space.
 Opening the port resets the board, and the arm then moves to its start pose (~10 s), which may be outside the box.
@@ -85,6 +87,37 @@ def check_target(bounds: dict, x, y, z) -> None:
                          f"({REACH_MIN_MM}-{REACH_MAX_MM} mm from the shoulder pivot)")
 
 
+def _cart(p):
+    """(r mm from the base axis, a degrees of base turn, z mm, gripper opening 0..1, led) -> (x, y, z, t, led)."""
+    a = math.radians(p[1])
+    return p[0] * math.cos(a), p[0] * math.sin(a), p[2], GRIP_CLOSED - p[3] * (GRIP_CLOSED - GRIP_OPEN), p[4]
+
+
+def trajectory(bounds: dict, start, keys, size: float, shift=(0, 0)) -> list:
+    """The 50 Hz samples (x, y, z, t, led) of a gesture from `start` (r, a, z, opening, led), eased into and out of each
+    keyframe. A nonzero `shift` (dr, dz) first moves the claw there (same direction) and plays the gesture around that.
+    Interpolated in cylindrical coordinates, so a change of `a` is a turn of the base, not a slide. Segments
+    are stretched so the peak speed stays under MAX_SPEED. Raises ValueError if any sample leaves the bounds or reach,
+    or comes nearer the base axis than the keep-out (or than the start, if that is nearer already)."""
+    base = (start[0] + shift[0], start[1], start[2] + shift[1])
+    lead = [(0.6, *base, start[3], start[4])] if any(shift) else []
+    prev, out = start, []
+    for secs, *frame in lead + [(secs, base[0] + dr * size, base[1] + da * size, base[2] + dz * size,
+                                 start[3] if grip is None else grip, start[4] if led is None else led)
+                                for secs, dr, da, dz, grip, led in keys]:
+        seg = lambda n: [_cart([a + (b - a) * u * u * (3 - 2 * u) for a, b in zip(prev, frame)])
+                         for u in (j / n for j in range(1, n + 1))]
+        coarse = [_cart(prev)] + seg(20)
+        length = sum(math.dist(p[:3], q[:3]) for p, q in zip(coarse, coarse[1:]))
+        out += seg(max(1, round(max(secs, length * 1.5 / MAX_SPEED) * RATE_HZ)))
+        prev = frame
+    for x, y, z, _, _ in out:
+        check_target(bounds, x, y, z)
+        if math.hypot(x, y) < min(BASE_KEEPOUT_MM, start[0] - 0.5):
+            raise ValueError(f"it would pass {math.hypot(x, y):.0f} mm from the base axis (keep-out {BASE_KEEPOUT_MM} mm)")
+    return out
+
+
 def find_port() -> str:
     ports = [p.device for p in list_ports.comports() if p.vid]  # USB serial devices only
     if len(ports) != 1:
@@ -95,6 +128,8 @@ def find_port() -> str:
 class Arm:
     def __init__(self, bounds: dict | None, port: str | None = None):
         self.target = None  # last (x, y, z) go_to aimed for: move_by builds on it, so sag does not add up
+        self.commanded = None  # last (x, y, z) actually sent: the target plus the sag correction
+        self.led_level = 0  # the arm does not report its LED; it boots dark
         self.bounds = bounds  # {"x": (lo, hi), "y": ..., "z": ...} in mm; every move is refused while this is None
         self.lock_ = threading.RLock()  # one physical action at a time (MCP tools run in worker threads)
         self.ser = serial.Serial()
@@ -161,6 +196,30 @@ class Arm:
             last = now
         return now
 
+    def _xyz_mode(self, fb) -> None:
+        """T:1041 takes its servo speed and acceleration from firmware globals, and every T:102 (lock) resets them to
+        0 = unlimited, which turns 50 Hz micro-steps into stop-go jerks. T:122 sets them and leaves them set, so send it
+        before streaming, with the current angles (no motion)."""
+        b, sh, e, h = (math.degrees(fb[k]) for k in "bset")
+        self._send({"T": 122, "b": b, "s": sh, "e": e, "h": h, "spd": XYZ_SERVO_SPEED_DEG, "acc": XYZ_SERVO_ACC_DEG})
+
+    def _correct(self, goal, aim, t, now):
+        """Sag correction: `aim` was last sent and the claw settled at `now`. Aim past `goal` by what it missed, up to 2
+        passes; the push past `goal` never exceeds SAG_MAX_MM. Returns the measured position."""
+        for _ in range(2):
+            if math.dist(now, goal) <= SAG_MIN_MM:
+                break
+            push = [a - n for a, n in zip(aim, now)]  # (aim - goal) + (goal - now): the old push plus the new miss
+            k = min(1, SAG_MAX_MM / math.hypot(*push))
+            new = [g + p * k for g, p in zip(goal, push)]
+            if math.dist((0, 0, 0), new) > REACH_MAX_MM + SAG_MAX_MM:
+                break
+            self._glide((*aim, t), (*new, t), 0.3, lambda p: {"T": 1041, "x": round(p[0], 1), "y": round(p[1], 1),
+                                                              "z": round(p[2], 1), "t": round(p[3], 3)})
+            aim, now = new, self._settle(lambda: self.read()[:3], 0.5)
+        self.commanded = tuple(aim)
+        return now
+
     def go_to(self, x: float, y: float, z: float, speed: float = DEFAULT_SPEED, t: float | None = None):
         """Move the claw to (x, y, z) mm in a straight line at `speed` mm/s (peak), and the gripper to angle t (None = keep
         it). Returns the measured final (x, y, z). Raises ValueError, before anything moves, if the target is outside the
@@ -180,29 +239,14 @@ class Arm:
             if closest < BASE_KEEPOUT_MM and closest < math.hypot(*start[:2]) - 0.5:  # moving away from the base is always allowed
                 raise ValueError(f"the straight path to ({x:g}, {y:g}, {z:g}) passes {closest:.0f} mm from the base axis "
                                  f"(keep-out {BASE_KEEPOUT_MM} mm); choose a target that avoids it")
-            # T:1041 takes its servo speed and acceleration from firmware globals, and every T:102 (lock) resets them
-            # to 0 = unlimited, which turns 50 Hz micro-steps into stop-go jerks. T:122 sets them and leaves them set, so
-            # send it first with the current angles (no motion).
-            b, sh, e, h = (math.degrees(fb[k]) for k in "bset")
-            self._send({"T": 122, "b": b, "s": sh, "e": e, "h": h, "spd": XYZ_SERVO_SPEED_DEG, "acc": XYZ_SERVO_ACC_DEG})
+            self._xyz_mode(fb)
             t = fb["t"] if t is None else t
             self._glide((*start, fb["t"]), (*goal, t), max(math.dist(start, goal) * 1.5 / speed, 0.2),
                         lambda p: {"T": 1041, "x": round(p[0], 1), "y": round(p[1], 1), "z": round(p[2], 1),
                                    "t": round(p[3], 3)})
-            self.target = goal
+            self.target = self.commanded = goal
             now = self._settle(lambda: self.read()[:3], 0.5)
-            aim = goal
-            for _ in range(2):  # aim past the target by what it missed; the push past `goal` never exceeds SAG_MAX_MM
-                if math.dist(now, goal) <= SAG_MIN_MM:
-                    break
-                push = [a - n for a, n in zip(aim, now)]  # (aim - goal) + (goal - now): the old push plus the new miss
-                k = min(1, SAG_MAX_MM / math.hypot(*push))
-                new = [g + p * k for g, p in zip(goal, push)]
-                if math.dist((0, 0, 0), new) > REACH_MAX_MM + SAG_MAX_MM:
-                    break
-                self._glide((*aim, t), (*new, t), 0.3, lambda p: {"T": 1041, "x": round(p[0], 1), "y": round(p[1], 1),
-                                                                  "z": round(p[2], 1), "t": round(p[3], 3)})
-                aim, now = new, self._settle(lambda: self.read()[:3], 0.5)
+            now = self._correct(goal, goal, t, now)
         error = math.dist(now, goal)
         if error > TOLERANCE_MM:
             raise RuntimeError(f"arm ended {error:.0f} mm from the target, at ({now[0]:.0f}, {now[1]:.0f}, {now[2]:.0f}): "
@@ -234,21 +278,75 @@ class Arm:
             for x, y, z, t in points:
                 self.go_to(x, y, z, speed, min(max(t, GRIP_OPEN), GRIP_CLOSED))
 
+    def perform(self, keys, size: float = 1.0):
+        """Play a gesture: keyframes (secs, dr, da, dz, grip, led) relative to the claw's pose now: dr mm out from the
+        base axis, da degrees of base turn (+ = left), dz mm up, all times `size`; grip (0 shut .. 1 wide) and led
+        (0..255) are absolute, None = as at the start. `keys` may instead be a function (ref (x, y, z), bounds) ->
+        keyframes, for gestures aimed at a place; those ignore `size`. If the path does not fit inside the limits, the
+        claw first slides (facing the same way) up to all the way to the middle of the box's x range and height, and
+        plays it there; only if that does not fit either is it shrunk (0.7, 0.5, 0.35 of the size). Unlike play, it flows
+        through the keyframes without settling at each, and every sample is checked before anything moves. It ends with
+        go_to's sag correction. Returns (measured (x, y, z), size used, mm slid first)."""
+        if not self.bounds:
+            raise RuntimeError("no bounds: draw them first with cli.py")
+        if isinstance(size, bool) or not isinstance(size, (int, float)) or not 0.2 <= size <= 1.5:
+            raise ValueError(f"size {size!r} is not in [0.2, 1.5]")
+        with self.lock_:
+            fb = self._feedback()
+            here = fb["x"], fb["y"], fb["z"]
+            if self.target and math.dist(here, self.target) <= TOLERANCE_MM:  # keep go_to's sag correction going
+                ref, off = self.target, [c - g for c, g in zip(self.commanded, self.target)]
+            else:
+                ref, off = here, (0, 0, 0)
+            slides = (0, .25, .5, .75, 1)
+            if callable(keys):
+                keys, size, slides = keys(ref, self.bounds), 1.0, (0,)  # aimed gestures go where they are aimed
+            opening = min(max((GRIP_CLOSED - fb["t"]) / (GRIP_CLOSED - GRIP_OPEN), 0), 1)
+            start = (math.hypot(*ref[:2]), math.degrees(math.atan2(ref[1], ref[0])), ref[2], opening, self.led_level)
+            mid = (sum(self.bounds["x"]) / 2 - start[0], sum(self.bounds["z"]) / 2 - start[2])
+            error = None
+            for k, f in ((k, f) for k in (1, 0.7, 0.5, 0.35) for f in slides):
+                try:
+                    samples = trajectory(self.bounds, start, keys, size * k, (mid[0] * f, mid[1] * f))
+                    break
+                except ValueError as e:
+                    error = error or e
+            else:
+                raise ValueError(f"the gesture does not fit here, even moved toward the middle of the box and shrunk to "
+                                 f"{size * k:.2g}x: {error}")
+            self._xyz_mode(fb)
+            t0, led = time.monotonic(), round(self.led_level)
+            for i, (x, y, z, t, level) in enumerate(samples):
+                time.sleep(max(0, t0 + i / RATE_HZ - time.monotonic()))  # clock-timed, like _glide
+                self._send({"T": 1041, "x": round(x + off[0], 1), "y": round(y + off[1], 1), "z": round(z + off[2], 1),
+                            "t": round(t, 3)})
+                if round(level) != led:
+                    led = round(level)
+                    self._send({"T": 114, "led": led})
+            self.led_level = led
+            self.target = samples[-1][:3]
+            aim = tuple(a + o for a, o in zip(self.target, off))
+            now = self._correct(self.target, aim, samples[-1][3], self._settle(lambda: self.read()[:3], 0.5))
+            return now, size * k, math.hypot(mid[0] * f, mid[1] * f)
+
     def led(self, level: int) -> None:
         """Gripper LED brightness, 0 (off) .. 255 (full). Tested on the arm 2026-11-07. The arm does not report it back."""
         if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 255:
             raise ValueError(f"LED level {level!r} is not an integer in [0, 255]")
         with self.lock_:
             self._send({"T": 114, "led": level})
+            self.led_level = level
 
     def free(self) -> None:
         """Torque off: the joints go limp so the arm can be moved by hand. Human use only."""
         self._send({"T": 210, "cmd": 0})
+        self.target = None
 
     def lock(self) -> None:
         """Lock the joints where they are now. A rotation command re-locks them, so command the measured angles."""
         with self.lock_:
             b, s, e, h = self.joints()
+            self.target = None
             self._send({"T": 102, "base": b, "shoulder": s, "elbow": e, "hand": h, "spd": 0, "acc": JOINT_ACC})
             time.sleep(0.2)
             fb = self._feedback()
