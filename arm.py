@@ -13,20 +13,23 @@ Three parts run side by side and talk only through queues, so none waits for ano
   progress, and the next reply is told what had already been done. Tool results only say "queued"; they go back with
   the next message instead of costing an extra API call.
 - Body: one thread that owns the arm and plays actions in order. The first body action of a newer reply drops what is
-  left of older replies and stops the motion in progress (Arm.abort, within 20 ms). After SETTLE_S without a movement
-  it goes back to the resting pose by itself (not from sleep).
-New messages and failed actions wake the brain; finished actions are only noted for its next turn. After IDLE_S of
-quiet it is woken once, so it can doze off. The conversation is only ever appended to, never edited: that keeps the
-prompt cache and Claude's thinking valid.
+  left of older replies and stops the motion in progress (Arm.abort, within 20 ms). With nothing to do it idles by
+  itself, without the brain (no API calls): straight after its last movement it goes back to rest, then fidgets from
+  MOODS that grow from content to bored to sleepy, until it falls asleep (the next movement wakes it first). Someone starting to talk
+  stops an idle move and holds off the next, like a pet listening.
+New messages and failed actions wake the brain; finished actions and mood changes are only noted for its next turn.
+The conversation is only ever appended to, never edited: that keeps the prompt cache and Claude's thinking valid.
 
 Each run is logged to logs/<start time>/transcript.jsonl, one JSON line per event, `t` in seconds from the start:
-heard / dropped (with the clip's .wav, saved next to it), speech (someone started talking), typed, arm (each action as
-it was queued), note (what the program told the brain), wrote, reply (latency, tokens, cache use), cut, error.
+heard / dropped, speech (someone started talking), typed, arm (each action as it was queued), idle (each fidget),
+note (what the program told the brain), wrote, reply (latency, tokens, cache use), cut, error.
 """
 
 import asyncio
 import json
+import math
 import os
+import random
 import sys
 import threading
 import time
@@ -45,10 +48,19 @@ from gestures import GESTURES, look_at
 # Speed first: Haiku, at low effort (it thinks less, and skips thinking on simple turns). If it seems too dim, raise
 # EFFORT to "medium", or use "claude-sonnet-5-5" or "claude-opus-5-5" (slower; Opus is the cleverest).
 MODEL, EFFORT = "claude-haiku-5-5", "low"
-IDLE_S = 120           # this long (s) without a message wakes the brain, once
-SETTLE_S, SETTLE_SPEED = 20, 150  # this long (s) without a movement, the arm goes back to rest by itself, this fast
+SETTLE_SPEED = 150     # mm/s: idling starts by going back to rest, this fast
+IDLE_GAP_S = (2, 5)   # s: idle fidgets come this far apart, at random, starting right after the brain's last movement
+HUSH_S = 8            # s: someone starting to talk holds off idling this long (the brain answers ~2 s after they stop)
+MOODS = [  # (s since the brain last moved it, what the brain is told, fidgets picked at random: a gesture, "glance"
+    # somewhere random, "look" at the person, "home" to rest; listing one twice makes it likelier)
+    (0, "you are idling by yourself", ["glance", "glance", "tilt", "calm", "home"]),  # not told: it's every turn
+    (30, "you are getting bored, fidgeting and looking for your person",
+     ["glance", "glance", "look", "beg", "curious", "play_bow", "home"]),
+    (120, "you are getting sleepy", ["yawn", "calm", "glance", "home"]),
+    (240, "you fell asleep by yourself", ["sleep"]),  # stays asleep until the brain moves it
+]
 PERSON = (600, 0, 300)  # mm: where the person usually is, so the arm can look at them. A guess: measure and adjust
-RUN = Path(__file__).with_name("logs") / time.strftime("%Y-%m-%d_%H-%M-%S")  # this run's transcript and clips
+RUN = Path(__file__).with_name("logs") / time.strftime("%Y-%m-%d_%H-%M-%S")  # this run's transcript
 T0 = time.monotonic()
 
 
@@ -91,7 +103,10 @@ done. Carry on from there without repeating yourself.
 facing wherever you face, and the ones that reach out (lean_in, curious, play_bow, greet) reach that way, so face \
 your person first when a gesture is meant for them.
 - You rest at {START} mm, folded back over your base (go_home). When things calm down, settle back there, like a pet \
-lying down again; if you stay away, you are moved there after a while.
+lying down again; when you stop moving, your body goes back there by itself.
+- When nothing is happening, your body idles by itself: it rests and glances around, gets bored, then sleepy, and in \
+the end falls asleep. You are told when that mood changes; you need not act on it. Asleep, your next movement wakes \
+you first, by itself (wake_up); if what you hear is not for you, just don't move, and sleep on.
 - {describe_limits(bounds)}
 - System messages come from the program that runs you (what your body did, how long it has been quiet), not from \
 your person."""
@@ -190,19 +205,32 @@ def log(kind: str, **record) -> None:
 
 class Body:
     """Owns the arm, in its own thread. Actions run in order; the first action of a newer reply (a new `gen`) drops
-    what older replies left and stops the one in progress. `report(text, wake)` is called from this thread."""
+    what older replies left and stops the one in progress. With nothing to do it idles by itself (MOODS).
+    `report(text, wake)` (a note for the brain) and `idling(text)` (an idle move) are called from this thread."""
 
-    def __init__(self, arm: Arm, report):
-        self.arm, self.report = arm, report
+    def __init__(self, arm: Arm, report, idling):
+        self.arm, self.report, self.idling = arm, report, idling
         self.todo, self.cv, self.gen, self.busy = deque(), threading.Condition(), 0, False
-        self.away = False  # the claw may be away from rest (and not asleep): after SETTLE_S of quiet it goes home
+        self.away = False  # the claw may be away from rest: idling starts by going home
+        self.asleep = False  # after the sleep gesture it does not idle until the brain moves it
+        self.since, self.mood, self.last = time.monotonic(), -1, None  # when the brain last moved it; idle state
+        self.hushed = 0  # when someone last started talking
         threading.Thread(target=self._run, daemon=True).start()
+
+    def hush(self) -> None:
+        """Someone started talking: stop an idle move (gen None) and hold off the next, like a pet listening."""
+        with self.cv:
+            self.hushed = time.monotonic()
+            if self.gen is None:
+                self._drop()
 
     def do(self, gen: int, label: str, fn) -> None:
         with self.cv:
             if gen != self.gen:
                 self.gen = gen
                 self._drop()
+                if self.asleep and not label.startswith("gesture(wake_up"):  # a pet wakes up before anything else
+                    self.todo.append(("gesture(wake_up)", lambda: self.arm.perform(GESTURES["wake_up"][1])))
             self.todo.append((label, fn))
             self.cv.notify()
 
@@ -219,24 +247,54 @@ class Body:
         while True:
             with self.cv:
                 while not self.todo:
-                    if not self.cv.wait(SETTLE_S) and self.away:  # quiet for a while: lie down again, like a pet
-                        self.gen = None  # so the next reply's first movement replaces this one
-                        self.todo.append(("went back to rest by itself",
-                                          lambda: self.arm.go_to(*START, SETTLE_SPEED, GRIP_CLOSED)))
+                    if not self.cv.wait(random.uniform(*IDLE_GAP_S)):
+                        self._idle()
                 label, fn = self.todo.popleft()
                 self.busy = True
+            idle = label.startswith("idle: ")
             try:
                 fn()
-                self.report(f"{label} done{self._where()}", False)
+                outcome, wake = "done", False
             except Interrupted:
-                self.report(f"{label} cut short{self._where()}", False)
+                outcome, wake = "cut short", False
             except Exception as e:  # refused (ValueError) or failed (RuntimeError, serial): the brain hears at once
-                self.report(f"{label} failed: {e}{self._where()}", True)
-            finally:
-                with self.cv:  # abort is only ever set while busy, so this leaves it clear for whatever comes next
-                    self.busy = False
-                    self.arm.abort.clear()
-                    self.away = not label.startswith(("went back to rest", "go_home", "gesture(sleep", "gesture(wake_up"))
+                outcome, wake = f"failed: {e}", True
+            with self.cv:  # abort is only ever set while busy, so this leaves it clear for whatever comes next
+                self.busy = False
+                self.arm.abort.clear()
+                self.asleep = label.startswith(("gesture(sleep", "idle: sleep"))
+                if not idle:
+                    self.since, self.mood = time.monotonic(), -1
+                    self.away = not label.startswith(("go_home", "gesture(sleep", "gesture(wake_up"))
+            if not idle:
+                self.report(f"{label} {outcome}{self._where()}", wake)
+            elif wake:  # a fidget that did not fit is just skipped
+                self.idling(f"{label[6:]} {outcome}")
+
+    def _idle(self) -> None:
+        """Nothing to do for a while: fidget, picked at random from the mood the quiet has reached."""
+        mood = sum(time.monotonic() - self.since >= m[0] for m in MOODS) - 1
+        if self.asleep or mood < 0 or time.monotonic() - self.hushed < HUSH_S:
+            return
+        if mood != self.mood:
+            self.mood, secs = mood, MOODS[mood][0]
+            if secs:
+                span = f"{secs:g} s" if secs < 60 else f"{secs / 60:g} minutes"
+                self.report(f"Nothing from your person for {span}: {MOODS[mood][1]}.", False)
+        what = "home" if self.away else random.choice([w for w in MOODS[mood][2] if w != self.last] or MOODS[mood][2])
+        self.away, self.last = False, what
+        if what == "home":
+            fn = lambda: self.arm.go_to(*START, SETTLE_SPEED, GRIP_CLOSED)
+        else:
+            if what == "glance":  # somewhere ahead, left or right, high or low. Wider turns from rest leave the box
+                a, r = math.radians(random.uniform(-30, 40)), random.uniform(400, 800)
+                keys = look_at(r * math.cos(a), r * math.sin(a), random.uniform(0, 400))
+            else:
+                keys = look_at(*PERSON) if what == "look" else GESTURES[what][1]
+            fn = lambda: self.arm.perform(keys)
+        self.gen = None  # so the next reply's first movement replaces it
+        self.todo.append((f"idle: {what}", fn))
+        self.idling(what)
 
     def _where(self) -> str:
         try:
@@ -254,11 +312,9 @@ class Brain:
         self.heard, self.notes = [], []  # the person's messages and the program's notes, not sent yet
         self.wake = asyncio.Queue()
         self.gen, self.task, self.t0, self.first = 0, None, 0, 0
-        self.last_heard, self.idle_noted = time.monotonic(), False
 
     def hear(self, text: str) -> None:
         self.heard.append(text)
-        self.last_heard, self.idle_noted = time.monotonic(), False
         self.wake.put_nowait(None)
 
     def note(self, text: str, wake=False) -> None:
@@ -369,14 +425,6 @@ class Brain:
         show(line + "\033[0m")
 
 
-async def idle(brain: Brain) -> None:
-    while True:
-        await asyncio.sleep(5)
-        if not brain.idle_noted and time.monotonic() - brain.last_heard > IDLE_S:
-            brain.idle_noted = True
-            brain.note(f"Your person has been quiet for {IDLE_S / 60:g} minutes.", wake=True)
-
-
 async def chat(brain: Brain) -> None:
     session = PromptSession()
     while True:
@@ -397,12 +445,19 @@ def heard(brain: Brain, kind: str, **info) -> None:
         brain.hear(info["text"])
     elif kind == "speech":
         show("  (listening...)", dim=True)
+        if brain.body:
+            brain.body.hush()
     elif kind == "dropped":
         show(f"  (ignored a sound: {info['why']}{': ' + repr(info['text']) if info.get('text') else ''})", dim=True)
     elif kind == "ready":
         show(f"(ears on: {info['mic']})", dim=True)
     elif kind == "error":
         show(f"(ears failed: {info['error']}. Typing still works.)", dim=True)
+
+
+def idling(what: str) -> None:
+    show(f"  (idle: {what})", dim=True)
+    log("idle", what=what)
 
 
 async def main() -> None:
@@ -419,21 +474,21 @@ async def main() -> None:
     brain = Brain(anthropic.AsyncAnthropic(), system_prompt(state["bounds"]))
     log("start", model=MODEL, effort=EFFORT)
     loop = asyncio.get_running_loop()
-    ears = Ears(lambda kind, **info: loop.call_soon_threadsafe(lambda: heard(brain, kind, **info)), RUN)
+    ears = Ears(lambda kind, **info: loop.call_soon_threadsafe(lambda: heard(brain, kind, **info)))
     print("Connecting. The arm resets and moves to its resting pose: keep clear...")
     arm = await asyncio.to_thread(Arm, state["bounds"])
-    brain.body = Body(arm, lambda text, wake: loop.call_soon_threadsafe(brain.note, text, wake))
+    brain.body = Body(arm, lambda text, wake: loop.call_soon_threadsafe(brain.note, text, wake),
+                      lambda what: loop.call_soon_threadsafe(idling, what))
     brain.note("You have just been switched on, at your resting pose.", wake=True)
     print(f"Talk to it (or type). Ctrl-C (or Ctrl-D) stops the arm and quits. Log: {RUN}/")
     with patch_stdout(raw=True):
-        workers = [asyncio.create_task(brain.run()), asyncio.create_task(idle(brain))]
+        worker = asyncio.create_task(brain.run())
         try:
             await chat(brain)
         finally:  # the kill switch works without the LLM: cut off the reply first, so it can queue nothing more
             brain.interrupt()
             ears.close()
-            for w in workers:
-                w.cancel()
+            worker.cancel()
             brain.body.stop()
             await asyncio.sleep(0.2)  # the body thread holds the claw where it is
             arm.close()

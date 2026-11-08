@@ -5,8 +5,7 @@ turns each one into text locally on the GPU, and arm.py hands the text to the br
         -> faster-whisper (STT_MODEL, CUDA) -> report("heard", text=...)
 
 Only what the detector calls speech is ever transcribed: given 3 s of room silence, Whisper wrote "Thank you." (with
-a no-speech probability of 0.0), so it must never see silence or hum. Every utterance, kept or dropped, is saved as a
-.wav in `clips`, so a test run can be checked afterwards.
+a no-speech probability of 0.0), so it must never see silence or hum.
 `report(kind, **info)` is called from the ears' own thread with kind "ready", "speech" (someone started talking),
 "heard", "dropped" or "error".
 """
@@ -16,7 +15,6 @@ import glob
 import queue
 import threading
 import time
-import wave
 from collections import deque
 
 import numpy as np
@@ -48,8 +46,8 @@ def load_cuda_libs() -> None:
 
 
 class Ears:
-    def __init__(self, report, clips):
-        self.report, self.clips, self.n = report, clips, 0
+    def __init__(self, report):
+        self.report = report
         self.audio = queue.Queue()  # 32 ms frames at 16 kHz; None ends listening
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -98,12 +96,7 @@ class Ears:
                 before.clear()
 
     def utterance(self, audio, voiced_s) -> None:
-        self.n += 1
-        info = {"clip": f"{self.n:03d}.wav", "speech_s": round(voiced_s, 2), "clip_s": round(len(audio) / RATE, 2)}
-        self.clips.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(self.clips / info["clip"]), "wb") as w:
-            w.setnchannels(1), w.setsampwidth(2), w.setframerate(RATE)
-            w.writeframes((np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes())
+        info = {"speech_s": round(voiced_s, 2), "clip_s": round(len(audio) / RATE, 2)}
         if voiced_s < MIN_SPEECH_S:
             return self.report("dropped", why="too short", **info)
         t = time.monotonic()

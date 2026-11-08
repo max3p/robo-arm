@@ -13,6 +13,8 @@ An LLM controls a desk robot arm through tool calls. The tools act in the physic
      a pet and it answers with movement. Input, brain and body all run at once, and any of them can interrupt the others.
    - **Phase 2.6 (built, 2026-11-07):** speech in. `ears.py` is always listening on the Blue Snowball and
      transcribes locally on the GPU. The arm answers only with movement.
+   - **Phase 2.7 (built, 2026-11-07):** idle life. Between inputs the body fidgets by itself, without the LLM:
+     content, then bored, then sleepy, then asleep.
 3. **Phase 3 (later):** a camera on the arm and a perception worker that feeds scene information back to the LLM.
 
 ## Quick start
@@ -91,7 +93,7 @@ The MCP client is the agent; there is no agent loop, LangGraph or API-key handli
 | File | Role |
 |---|---|
 | `motion.py` | Motion API: `Arm.go_to` (straight-line, safety-checked, sag-corrected), `gripper`, `play(points)`, `led`, `read`, `free`, `lock`; `perform(keys, size)` plays a gesture (see below); `abort` (a `threading.Event`: set from any thread, the move in progress holds the claw where it is and raises `Interrupted` within 20 ms); `check_target`; `describe_limits`; `load_state`/`save_state`; all tuned constants with the measurements behind them. **Never prints or prompts**: stdout carries the MCP protocol |
-| `arm.py` | The pet chat (Phase 2.5): prompt, brain loop, body thread, the tools and the system prompt. Knobs at the top: `MODEL`, `EFFORT`, `IDLE_S`, `PERSON` |
+| `arm.py` | The pet chat (Phase 2.5): prompt, brain loop, body thread, the tools and the system prompt. Knobs at the top: `MODEL`, `EFFORT`, `IDLE_GAP_S`, `HUSH_S`, `MOODS` (idle, Phase 2.7), `PERSON` |
 | `ears.py` | Speech in (Phase 2.6): mic thread, Silero voice detector, faster-whisper on the GPU. Knobs at the top: `MIC`, `STT_MODEL`, `SILENCE_S`, `MIN_SPEECH_S`, `MIN_LOGPROB` |
 | `cli.py` | Human REPL. Commands: `read`, `move`, `grip` (radians), `home`, `led`, `bounds` (free the arm and sweep the claw; samples every 100 ms; the min/max becomes the box), `trace` (show the 6 faces of the box), `record NAME` (Enter per point, q to save; one point = a pose), `play NAME`, `gesture NAME [size]`, `look x y z`, `paths`, `delete NAME`. Ctrl-C stops motion |
 | `gestures.py` | The gestures as data: keyframes `K(secs, dr, da, dz, grip, led)` relative to the current pose (dr out from the base axis, da degrees of base turn, dz up), plus functions for the aimed ones (`sleep`, `wake_up`, `look_at`) |
@@ -281,6 +283,7 @@ cut in. The companion is our own app on the Claude API, so we control the inputs
      - never make up facts about its body.
    - **Settling:** after `SETTLE_S` (20 s) without a movement, the body goes back to rest by itself, at 150 mm/s. It
      doesn't do this after sleep or after it's already home. The prompt also asks it to settle when things calm down.
+     (Since Phase 2.7 this is the first step of idling, right after the last movement; `SETTLE_S` is gone.)
 2. **Each call runs as soon as its block has streamed** (`eager_input_streaming`, acting at `content_block_stop`), so
    the arm moves while Claude is still writing.
    - Results only say "queued". They go back with the next message, so a reply costs one API call, not one per move.
@@ -297,7 +300,8 @@ cut in. The companion is our own app on the Claude API, so we control the inputs
    - Finished and cut-short actions become notes for the next turn, with the claw position.
    - A refused or failed action wakes the brain at once, even mid-reply, which cuts that reply off and restarts it
      knowing about the failure.
-   - After `IDLE_S` (120 s) without a message, the brain is woken once, so it can doze off.
+   - ~~After `IDLE_S` (120 s) without a message, the brain is woken once, so it can doze off.~~ Replaced in Phase 2.7
+     by idling in the body, with no API calls.
 7. **Safety stays in code.**
    - Ctrl-C stops the arm, cancels the reply and quits, without an LLM round trip.
    - Every limit is still checked by `motion.py` when an action runs.
@@ -386,12 +390,12 @@ Blue Snowball (48 kHz, via PipeWire) ─► 16 kHz ─► Silero voice detector 
 6. **If the ears fail** (no mic, no GPU), the screen says so and typing still works.
 
 **The transcript log, for checking test runs.** Each run writes `logs/<start time>/`:
-- `transcript.jsonl`: one line per event, `t` in seconds from the start: `heard` (text, clip, speech length, Whisper
+- `transcript.jsonl`: one line per event, `t` in seconds from the start: `heard` (text, speech length, Whisper
   time, log-probability), `dropped` (why), `speech` (started talking), `typed`, `arm` (each action as queued, and how
-  far into the reply), `note` (what the program told the brain), `wrote`, `reply` (latency, tokens, cache), `cut`,
-  `error`, `start` and `stop`.
-- `001.wav`, `002.wav`, ...: every utterance the detector cut out, kept or dropped, so mishearings and false triggers
-  can be checked by replaying them.
+  far into the reply), `idle` (each fidget, Phase 2.7), `note` (what the program told the brain), `wrote`, `reply`
+  (latency, tokens, cache), `cut`, `error`, `start` and `stop`.
+- Each utterance was also saved as a .wav at first, for checking. Removed after the first real test (2026-11-07) went
+  well, to save disk space.
 
 **Tested (2026-11-07):**
 - Synthetic speech (espeak-ng) fed straight to the detector: 4 phrases with noise and a hiss burst between them came
@@ -409,16 +413,60 @@ Blue Snowball (48 kHz, via PipeWire) ─► 16 kHz ─► Silero voice detector 
     Haiku.
 - The real Snowball opened and ran without a false trigger in a quiet room.
 
-**Not yet checked:**
-- Real voices (the user tests by talking to it; I read `logs/` afterwards).
-- Whether the arm's own motor noise triggers the detector. The test with the real arm couldn't run: the arm reported
-  an impossible pose (-250, 0, -238), which looks like the servos' 12 V supply was off.
+**First real test by the user (2026-11-07, `logs/2026-11-07_20-48-38`):** 13 utterances, all transcribed word for
+word (log-probability -0.03 to -0.35), one blip dropped as too short, and no false triggers from the arm's own motors
+while it moved. Asked to sleep and then to wake up, it did both.
+
+## Phase 2.7: idle life (built 2026-11-07)
+
+Between inputs the arm used to sit still. Now the body thread idles by itself whenever it has nothing to do:
+
+| Quiet for (since the brain last moved it) | Mood | Fidgets, picked at random 2-5 s apart (`IDLE_GAP_S`) |
+|---|---|---|
+| 0 s | content | first back to rest, then glance around, tilt, calm |
+| 30 s | bored | glance, look at the person, beg, curious, play_bow, back to rest (no yawn: too many, said the user) |
+| 2 min | sleepy | yawn, calm, glance, back to rest |
+| 4 min | asleep | the `sleep` gesture, then nothing until the brain moves it |
+
+It never just sits there: idling starts right after the brain's last movement, and nothing in the list is "stay
+still". (First built with 20 s / 2 / 5 / 8 min, 6-18 s gaps and "stay still" fidgets; the user found that too
+static, 2026-11-07.)
+
+**Decisions:**
+1. **No LLM while idle.** Fidgets are picked locally from `MOODS`, so idling costs no API calls (the old `IDLE_S`
+   wake-up of the brain is gone). The brain gets one note per mood change ("Nothing from your person for 2 minutes:
+   you are getting bored, ..."), not one per fidget, so its mood carries into the next reply. The content mood is not
+   noted, since it starts after every reply.
+2. **The brain always wins.** Idle moves are queued like a cut-off reply (`gen = None`), so the first movement of any
+   reply stops them. Only the brain's own movements reset the quiet clock: if it decides speech isn't for it (the
+   TV), the boredom carries on.
+3. **Someone starting to talk** (the ears' `speech` event) stops an idle move at once and holds off the next for
+   `HUSH_S` (8 s), like a pet pricking up its ears. It also keeps the motors quiet while the mic listens.
+4. **Waking is in code:** if it is asleep, the first movement of a reply plays `wake_up` first. In testing, Haiku
+   ignored the prompt's "wake_up first" and played `excited` from the low sleep pose. If the brain doesn't move at
+   all, it sleeps on.
+5. **Glances aim at a random point -30° to 40° around the base.** From rest the claw is only 161 mm from the base
+   axis, so wider turns leave the box (x ≥ 117.6, y ≥ -102.4): -60° to 75° would have refused 45% of glances in
+   simulation, and -30° to 40° refused none of 3000.
+
+**Tested (2026-11-07):**
+- On the real arm, with the moods sped up (rest at 3 s, bored at 25 s, sleepy at 55 s, asleep at 80 s): it went
+  home, then tilt, calm, yawn, look, play_bow, yawn, glance, calm, then fell asleep and stayed asleep. A brain `nod`
+  mid-idle replaced the fidget and reset the clock. `hush` cut `calm` short.
+- End to end with the real API, a fake mic and a fake arm (sped up): mood notes reached the brain; nothing idled
+  between speech and the reply; "Hey buddy, wake up!" after it fell asleep played `wake_up`, then the brain's `happy`.
+
+- On the real arm at the real timings: after a `look_at`, idling began ~5 s later; bored at 30 s, sleepy at 2 min,
+  asleep at 4 min, and never motionless for more than 5 s before that.
+
+**Not yet checked:** whether it feels right to the user. The timings and fidget lists are knobs at the top of
+`arm.py`.
 
 ## Future feature: sleep and a wake word (asked for 2026-11-07, not built)
 
 For now the arm listens all the time (Phase 2.6), and every utterance it hears goes to the brain. Later:
-- After some time with nothing said to it, it goes to sleep (the `sleep` gesture), and the brain stops getting what it
-  hears.
+- After some time with nothing said to it, it goes to sleep (the `sleep` gesture; built in Phase 2.7), and the brain
+  stops getting what it hears (not built: it still hears everything).
 - While asleep, the ears listen only for a wake word (its name), locally with no API calls, using a small keyword
   model (e.g. openWakeWord) or a cheap check of the Whisper transcript.
 - On the wake word it perks up (`wake_up`, then `look_at` the person) and goes back to always listening.
