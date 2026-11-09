@@ -55,16 +55,17 @@ from ears import Ears
 from eyes import SETTLE_S, Eyes, locate
 from motion import (DEFAULT_SPEED, GRIP_CLOSED, GRIP_OPEN, MAX_SPEED, MIN_SPEED, START, Arm, Interrupted,
                     check_target, describe_limits, load_state)
-from gestures import GESTURES, aim, follow, listen, look_at
+from gestures import GESTURES, listen, look_at
+from track import Tracker
 
 # Speed first: Haiku, at low effort (it thinks less, and skips thinking on simple turns). If it seems too dim, raise
 # EFFORT to "medium", or use "claude-sonnet-5-5" or "claude-opus-5-5" (slower; Opus is the cleverest).
 MODEL, EFFORT = "claude-haiku-5-5", "low"
 SETTLE_SPEED = 150     # mm/s: idling starts by going back to rest, this fast
 IDLE_GAP_S = (2, 5)   # s: idle fidgets come this far apart, at random, starting right after the brain's last movement
-TICK_S = 0.25         # s: how often an idle body checks for a face to follow
-TRACK_DEG = 8         # a face in view further than this off the camera's axis (sideways or up and down) is turned to
-TRACK_GAIN = 0.7      # ... this much of the way: all of it overshot, as faces' angles and distances are rough
+TICK_S = 0.25         # s: how often an idle body checks for someone to follow
+WATCH_GAP_S = (6, 15) # s: following someone (track.py), it stops for a fidget this far apart, at random
+HOLD_S = 5            # s: after the brain turns it somewhere (look_at, move_to, go_home), following waits this long
 HUSH_S = 8            # s: someone starting to talk holds off idling this long (the brain answers ~2 s after they stop)
 MOODS = [  # (s of nothing happening: no movement from the brain, no one moving in view; what the brain is told;
     # fidgets picked at random: a gesture, "glance" somewhere random, "look" at the face last seen (or glance), "home"
@@ -124,17 +125,18 @@ went when something new happens; a refused or failed movement wakes you at once.
 - The first movement of a reply replaces whatever movement is still playing from before. To stop moving, call `stop`.
 - If your person speaks while you are still replying, your reply is cut off and you are told what you had already \
 done. Carry on from there without repeating yourself.
-- To look at your person, call look_at_person: your body turns to where your camera last saw a face, and looks \
-round for one if no one is there. Never guess where your person is: they move about. look_at is for things and \
-places. Gestures play \
-facing wherever you face, and the ones that reach out (lean_in, curious, play_bow, greet) reach that way, so face \
-your person first when a gesture is meant for them.
+- Face tracking is on unless you turn it off: whenever your camera sees someone, your body keeps it on their face \
+(or their head, if they are turned away), turning and tilting as they move, by itself and at once. Your gestures \
+play facing them, and it carries on after each one. After look_at, move_to or go_home it waits a few seconds, then \
+turns back to them. To look at something else for longer (an object, the window), call stop_face_tracking first, \
+and start_face_tracking when you are done. If you have lost your person, call look_at_person: your body turns to \
+where your camera last saw a face, and looks round for one if no one is there. Never guess where your person is: \
+they move about. look_at is for things and places. The gestures that reach out (lean_in, curious, play_bow, \
+greet) reach the way you face.
 - You rest at {START} mm, folded back over your base (go_home). When things calm down, settle back there, like a pet \
 lying down again.
-- Between your movements your body carries on by itself: it keeps your camera on the nearest face, turns to your \
-person when they start talking, looks for them again where it last saw them when it has lost them, and looks around \
-curiously when no one is in view. So you need not turn to follow \
-them yourself. When nothing happens for a while it gets bored, then sleepy, and in the end falls asleep. You are told when that mood changes; you need not act on it. Asleep (by yourself, or when \
+- Between your movements your body carries on by itself: it follows your person (face tracking), looks for them \
+again where it last saw them when it has lost them, and looks around curiously when no one is in view. When nothing happens for a while it gets bored, then sleepy, and in the end falls asleep. You are told when that mood changes; you need not act on it. Asleep (by yourself, or when \
 told to sleep), you hear nothing at all until someone says your name; that wakes you (wake_up plays by itself), and \
 you hear what they said.
 - {describe_limits(bounds)}
@@ -161,8 +163,10 @@ TOOLS = [
          name={"type": "string", "enum": list(GESTURES)}),
     tool("look_at", "Turn and tilt your camera to face the point (x, y, z) mm, then perk up toward it for a moment. It "
          "does not reach for it, and stays facing it. The point may be outside the limits.", ["x", "y", "z"], **XYZ),
-    tool("look_at_person", "Turn your camera to your person's face: to where it last saw a face, and if no one is "
-         "there, look round until it finds one. Use this whenever you mean to look at them."),
+    tool("look_at_person", "Find your person: turn your camera to where it last saw a face, and if no one is there, "
+         "look round until it finds one. With face tracking on and someone in view, it is already on them."),
+    tool("start_face_tracking", "Keep your camera on your person by yourself, as they move (on at the start)."),
+    tool("stop_face_tracking", "Stop following your person, to look at something else for a while."),
     tool("move_to", "Move the claw in a straight line to (x, y, z) mm.", ["x", "y", "z"], **XYZ, speed=SPEED),
     tool("go_home", f"Go back to the resting pose {START} mm, gripper shut.", speed=SPEED),
     tool("gripper", "Open or shut the claw: 0 = shut .. 1 = wide.", ["opening"], opening=num("0-1")),
@@ -252,6 +256,8 @@ def seek(arm: Arm, eyes) -> str:
         with eyes.lock:
             faces, frame_t = eyes.faces, eyes.frame_t
         return locate(max(faces, key=lambda f: f[2]), arm._feedback())[3] if faces and frame_t > after else None
+    if eyes.target and time.monotonic() - eyes.target[0] < 0.3:
+        return "someone is in view already"
     if eyes.nearest:
         arm.perform(look_at(*eyes.nearest[3]))
     fb = arm._feedback()
@@ -292,17 +298,21 @@ class Body:
         self.asleep = False  # after the sleep gesture it does not idle until the brain moves it
         self.since, self.mood, self.last = time.monotonic(), -1, None  # when the brain last moved it; idle state
         self.hushed = 0  # when someone last started talking
-        self.stopped, self.next, self.track_t = 0, 0, 0  # when the last action ended; the next fidget; no follow before
+        self.stopped, self.next = 0, 0  # when the last action ended; when the next fidget is due
+        self.tracking, self.tracker = True, None  # following people (start/stop_face_tracking); the Tracker
+        self.watch = self.hold = 0  # following until then, then a fidget; not following before then
         self.sought = None  # the sighting (its time) last looked for again
         threading.Thread(target=self._run, daemon=True).start()
 
     def hush(self) -> None:
         """Someone started talking: like a pet, stop idling (gen None), turn to the face it last saw (or, if none
-        yet, perk up and lean forward), and hold off fidgets for HUSH_S (following a face goes on). Not while asleep
-        or waking up, or while the brain's movements play; the brain's next movement replaces it."""
+        yet, perk up and lean forward), and hold off fidgets for HUSH_S. Not while asleep or waking up, while the
+        brain's movements play, or while following someone (it already faces them); the brain's next movement
+        replaces it."""
         with self.cv:
             self.hushed = time.monotonic()
-            if self.asleep or self._waking() or (self.gen is not None and (self.current or self.todo)):
+            if (self.asleep or self._waking() or (self.gen is not None and (self.current or self.todo))
+                    or self.current == "idle: track"):
                 return
             self._drop()
             self.gen, self.away = None, True  # away: idling starts again by going home
@@ -378,14 +388,16 @@ class Body:
                 if not idle:
                     self.since, self.mood = time.monotonic(), -1
                     self.away = not label.startswith(("go_home", "gesture(sleep", "gesture(wake_up"))
+                    if label.startswith(("look_at(", "move_to(", "go_home(")):  # let it be seen before following on
+                        self.hold = time.monotonic() + HOLD_S
             if not idle:
                 self.report(f"{label} {outcome}{where}", wake, picture)
             elif wake:  # a fidget that did not fit is just skipped
                 self.idling(f"{label[6:]} {outcome}")
 
     def _idle(self) -> None:
-        """Nothing to do (every TICK_S): follow the nearest face in view, and every IDLE_GAP_S fidget, picked at random
-        from the mood the quiet has reached."""
+        """Nothing to do (every TICK_S): follow someone in view (track.py), stopping every WATCH_GAP_S for a fidget;
+        with no one, fidget every IDLE_GAP_S. Fidgets are picked at random from the mood the quiet has reached."""
         now = time.monotonic()
         mood = sum(now - self.since >= m[0] for m in MOODS) - 1
         if self.asleep or mood < 0:
@@ -396,28 +408,25 @@ class Body:
                 span = f"{secs:g} s" if secs < 60 else f"{secs / 60:g} minutes"
                 self.report(f"Nothing from your person for {span}: {MOODS[mood][1]}.", False)
         face = self.eyes and self.eyes.nearest  # (when, degrees right, degrees up, look_at point)
-        in_view = face and face[0] > self.stopped and now - face[0] < 1  # seen since the arm last stopped
-        if in_view and max(abs(face[1]), abs(face[2])) > TRACK_DEG and now > self.track_t and self.fb:
-            here = self.fb["x"], self.fb["y"], self.fb["z"]
-            yaw0 = math.degrees(math.atan2(here[1], here[0]))
-            yaw = yaw0 + TRACK_GAIN * (math.degrees(math.atan2(face[3][1], face[3][0])) - yaw0)
-            goal = aim(self.arm.bounds, here, yaw, TRACK_GAIN * face[2])
-            if goal and math.dist(goal, here) > 10:  # not already as near as the box allows
+        target = self.eyes and self.eyes.target
+        in_view = target and target[0] > self.stopped and now - target[0] < 0.5  # someone, since the arm last stopped
+        if self.tracking and in_view and now > self.hold:
+            if now < self.watch or now - self.hushed < HUSH_S:  # follow them until a fidget is due
+                self.tracker = self.tracker or Tracker(self.arm, self.eyes)
                 self.gen, self.away = None, True
-                self.todo.append(("idle: follow", lambda: self._follow(goal)))
-                return self.idling(f"follow a face {face[1]:+.0f} deg right, {face[2]:+.0f} deg up: to "
-                                   f"({goal[0]:.0f}, {goal[1]:.0f}, {goal[2]:.0f})")
-        if now < self.next or now - self.hushed < HUSH_S:
+                self.todo.append(("idle: track", lambda: self.tracker.run(self._watching)))
+                return self.idling(f"follow the {target[3]}")
+        elif now < self.next or now - self.hushed < HUSH_S:
             return
-        self.next = now + random.uniform(*IDLE_GAP_S)
+        self.next, self.watch = now + random.uniform(*IDLE_GAP_S), now + random.uniform(*WATCH_GAP_S)
         if face and not in_view and now - face[0] < LOST_S and face[0] != self.sought:  # lost them: look where they were
             self.sought, self.gen = face[0], None
             self.todo.append(("idle: find", lambda: self.arm.perform(look_at(*face[3]))))
             return self.idling("find the face last seen")
         what = "home" if self.away and not in_view else random.choice(
             [w for w in MOODS[mood][2] if w != self.last] or MOODS[mood][2])
-        if in_view and mood == 0 and what == "glance":  # watching someone: keep at it
-            return
+        if in_view and mood == 0 and what in ("glance", "look"):  # following someone: keep at it (look aims at where
+            return  # their face was last placed, which may be out of date: it turned 34 degrees off them, 2026-11-08)
         self.away, self.last = self.away and what != "home", what
         if what == "home":
             fn = lambda: self.arm.go_to(*START, SETTLE_SPEED, GRIP_CLOSED)
@@ -434,13 +443,22 @@ class Body:
         self.todo.append((f"idle: {what}", fn))
         self.idling(what)
 
-    def _follow(self, point) -> None:
-        try:
-            self.arm.perform(follow(*point))
-        except ValueError:  # turned as far as the box allows: not again for a while
-            self.track_t = time.monotonic() + 5
-            raise
-        self.since = time.monotonic()  # someone moving in view: something is happening
+    def _watching(self) -> bool:
+        """Following someone: go on? Not once there is something to do, following is turned off, or a fidget is due
+        (and no one is talking). Someone moving about is something happening: no boredom."""
+        now = time.monotonic()
+        if not self.tracker.calm():
+            self.since = now
+        return self.tracking and not self.todo and (now < self.watch or now - self.hushed < HUSH_S)
+
+    def pose(self):
+        """Where the camera is, for the eyes: the arm's feedback while it is still, the tracker's while it follows
+        slowly; None while it moves."""
+        if self.current is None and not self.todo:
+            return self.fb
+        if self.current == "idle: track" and self.tracker.calm():
+            return self.tracker.fb
+        return None
 
     def _where(self) -> str:
         try:
@@ -572,6 +590,10 @@ class Brain:
                 self.body.stop()
                 self.done(did, "stopped moving", "arm> stop")
                 result = "stopped"
+            elif block.name in ("start_face_tracking", "stop_face_tracking"):
+                self.body.tracking = block.name.startswith("start")
+                self.done(did, block.name, f"arm> {block.name}")
+                result = "on" if self.body.tracking else "off"
             else:
                 fn = body_action(self.body.arm, block.name, a, self.body.ears, self.body.eyes)
                 label = f"{block.name}({', '.join(f'{v:g}' if isinstance(v, (int, float)) else str(v) for v in a.values())})"
@@ -679,7 +701,7 @@ async def main() -> None:
                 lambda: brain.body.asleep)
     brain.body.ears = ears
     brain.body.eyes = Eyes(lambda kind, **info: loop.call_soon_threadsafe(lambda: saw(brain, kind, **info)),
-                           lambda: brain.body.fb if brain.body.current is None and not brain.body.todo else None)
+                           brain.body.pose)
     brain.note("You have just been switched on, at your resting pose.", wake=True)
     print(f"Talk to it (or type). Ctrl-C (or Ctrl-D) stops the arm and quits. Log: {RUN}/")
     with patch_stdout(raw=True):

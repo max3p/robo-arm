@@ -120,7 +120,8 @@ in control:
 | `play(name, speed=300)` | Replays a hand-taught path from `arm_state.json` |
 | `gesture(name, size=1)` | Body language, by name (an enum in the schema; the description says what each means). Relative ones play wherever the claw is and end where they started; `size` 0.2-1.5. If one does not fit it first slides toward the middle of the box, then shrinks (down to 0.35x); the result gives `size_used` and `slid_mm` |
 | `look_at(x, y, z)` | Turns the base to face a point and moves half way to its height, then a small perk. Stays facing it; turns part way if the full turn does not fit |
-| `look()` | A picture (JPEG, 800x450) from the camera above the claw. Opens the camera for that picture only, and never opens the arm |
+| `look()` | A picture (JPEG, 800x450) from the camera above the claw. Opens the camera for that picture only (or uses the tracking's), and never opens the arm |
+| `start_face_tracking()` / `stop_face_tracking()` | Follow whoever the camera sees, in real time (track.py), between tool calls; other tools pause it, and after a move it waits 5 s, then turns back to them |
 
 The bounds reach the model before it acts in three ways: in the server instructions, in every motion tool's description, and from `workspace()`.
 
@@ -774,6 +775,60 @@ The user ruled out a fixed point for the person ("it should track this itself, t
   and none for the desk and the stretch.
 - **Tested:** on the real arm, with the user away (empty chair), `look_at_person` from 90° right looked all round
   and reported no face. Finding and facing a real person is still to test.
+
+## Phase 3.3: real-time face tracking, `track.py` (built 2026-11-08)
+
+The user's next session (`logs/2026-11-08_17-47-36`): following them seated was good, but when they stood up and
+moved away "it takes a long while, several movements, and some verbal help until it finds me again". The step-wise
+following was too slow (one correction every 1.5-2.5 s, waiting for a still, sharp frame each time). Each thing they
+said started a new reply that cut `look_at_person`'s search short (4 times in a row). And following ran only
+between the brain's movements. The user proposed tracking without the LLM, with start/stop tools, as the pose the
+arm's movements are relative to.
+
+```
+camera ~30 fps -> YuNet faces (CPU) -> the face nearest the middle
+               -> no face: Faster R-CNN MobileNetV3 320 (torchvision, GPU, 16 ms, 61 MB) -> the head of the person
+                  nearest the middle (HEAD: 0.28 of the box's width below its top)
+               -> eyes.target: (time, degrees right, degrees up, "face" / "person"), every frame, moving or not
+track.Tracker, ~50 Hz in Arm.follow: turn and tilt at GAIN (2) deg/s per degree off (deadband 2, at most 60 and
+               40 deg/s, rates change at most 240 deg/s^2) -> T:1041 stream, every point checked like any move
+```
+
+- **Visual servoing, not positions.** It uses only where the target is in the picture. Bad distances can't throw it,
+  and it needs no still frames. The arm lags ~0.3 s and the camera ~0.1 s, so GAIN is about 2 (phase margin ~45°).
+  Simulated with those lags, someone walking 30° at 40°/s stayed within 22° of the middle (the picture is ±38°
+  wide), and standing up (25° at 25°/s) within 18° (±23.6° high). It then settled with a 3° overshoot.
+- **Tilting** sets the forearm's angle and keeps the upper arm where it was, raising it only as far as the reach
+  limit needs. That covers about -38° to 55°. Turn and tilt are checked separately, so the box stopping one doesn't
+  stop the other. It never turns past `BEHIND_DEG`, or into the keep-out.
+- **Lost:** it keeps turning the way the target went for `SEARCH_S` (1.5 s), then stops. The body then looks where
+  the face was last placed (`LOST_S`), then fidgets. When `look_at_person` already has someone in view it returns
+  at once.
+- **People, not just faces.** YuNet finds only faces turned toward the camera. The person detector (run only on
+  frames with no face) finds people from any side. Of torchvision's detectors on the test photos, Faster R-CNN
+  MobileNetV3 found every person: 320 px at 16 ms, full size at 17 ms. `ultralytics`' YOLO was ruled out: it would
+  install a second OpenCV (not headless) and plotting libraries.
+- **In the pet (arm.py).** Face tracking is on by default (`Body.tracking`). Whenever the body has nothing to do and
+  someone is in view, it runs the tracker as an idle action. It stops for a fidget every `WATCH_GAP_S` (6-15 s:
+  tilt, curious; not glance or look, which turn away), and for anything the brain sends. Gestures are relative, so
+  they play facing the person, and tracking carries on after them. After look_at, move_to and go_home it waits
+  `HOLD_S` (5 s), so the brain's look is seen. Speech no longer interrupts it (it already faces them). Someone
+  moving in view resets the boredom clock. The brain has `start_face_tracking` and `stop_face_tracking`, and is told
+  to stop it to look at something else for a while. The eyes place faces (`nearest`, the view's look_at points)
+  from the tracker's pose while it moves slowly (under 5°/s); the vision model describes then too.
+- **In the MCP server.** `start_face_tracking` opens the camera with the detectors but no vision model, and follows
+  people in a background thread. Every tool pauses it while it runs (the stream lets go of the arm within 20 ms). After
+  a move it waits 5 s. If the person is then out of view, it goes back to where it faced them, then follows on.
+- **Tested on the real arm** (2026-11-08, the user at the desk):
+  - Body and eyes only (90 s): it followed them at up to 47°/s. Sitting still, it held their face within 1-2° for
+    40 s without hunting, which shows the loop is stable. Targets were 10-60 ms old when used. It followed their body
+    twice when no face was found.
+  - The fidget `look` aimed at an out-of-date face position and turned 34° off them: dropped while following.
+  - MCP: it found the user within 1 s of the detectors loading. `nod` played without losing them. After `look_at`
+    away it came back to them 5 s later.
+  - End to end with Claude (93 s): told to stop following and look at the window, it called stop_face_tracking,
+    then look_at. Later it called start_face_tracking, and tracking resumed after its gestures.
+  - Not yet seen: walking away and standing up with the real arm.
 
 ## Constraints
 

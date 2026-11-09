@@ -11,9 +11,12 @@ reacts, and it answers only with body language: nods, head tilts, a play bow, le
   is saved.
 - **Moves while it thinks:** each movement starts as soon as Claude has written it, and speaking cuts off a reply
   in progress.
-- **Has a life of its own:** between conversations it watches. It keeps its camera on the nearest face, turns to
-  whoever starts talking, and looks around when no one is in view. When nothing happens it gets bored, then sleepy,
-  and falls asleep. This runs locally, with no API calls.
+- **Follows you with its camera in real time:** a face detector and a person detector find you in every frame, and
+  the arm turns and tilts to keep you in the middle of the picture as you move, sit or stand. It finds you by your
+  body when your face is turned away. Its gestures play facing you. Claude can switch it off to look at something
+  else, and on again. This runs locally, with no API calls.
+- **Has a life of its own:** when it has lost you it looks where you went, then where it last saw you, then around.
+  When nothing happens it gets bored, then sleepy, and falls asleep.
 - **Asleep, it ignores everything except its name:** "Robert" or "Rob" wakes it.
 - **Dances to music:** "Rob, dance to this song!" makes it listen for 3 s, then bob to the beat for 30 s, the whole
   arm bouncing with the claw level. It keeps listening as it dances and settles on the tempo it hears most, bobbing
@@ -66,7 +69,8 @@ use. The bounds are saved to `arm_state.json`.
 |---|---|
 | [arm.py](arm.py) | The pet. The brain (Claude, streaming tool calls) and the body thread (actions, idling, moods, sleep). Settings at the top: `MODEL`, `MOODS`, `NAME`, `TRACK_DEG` |
 | [ears.py](ears.py) | Speech in. The mic, a voice detector and Whisper on the GPU |
-| [eyes.py](eyes.py) | Sight in. The camera, a face detector, and a small vision model on the GPU that describes the scene |
+| [eyes.py](eyes.py) | Sight in. The camera, a face detector, a person detector, and a small vision model on the GPU that describes the scene |
+| [track.py](track.py) | Face tracking: turns and tilts the arm ~50 times a second to keep the person in the middle of the picture |
 | [dance.py](dance.py) | Dancing: finds the beat in what the mic hears and bobs the arm to it |
 | [gestures.py](gestures.py) | Body language as keyframes: nod, shake, happy, lean_in, sleep, wake_up, look_at and more |
 | [motion.py](motion.py) | Safe motion on the arm: straight-line moves, sag correction, gestures, stopping within 20 ms. All limits are checked here |
@@ -80,8 +84,9 @@ use. The bounds are saved to `arm_state.json`.
 claude mcp add robo-arm -- $PWD/.venv/bin/python $PWD/mcp_server.py
 ```
 
-Claude then gets tools to move the arm, play gestures, look at points, play taught paths and take a picture with
-the camera (`look`). It's limited to the same box.
+Claude then gets tools to move the arm, play gestures, look at points, play taught paths, take a picture with the
+camera (`look`) and follow a person with it (`start_face_tracking`, `stop_face_tracking`). It's limited to the same
+box.
 
 ## Safety
 

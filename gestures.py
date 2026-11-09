@@ -116,15 +116,6 @@ def aim(bounds, here, yaw, up, step=120):
     return None
 
 
-def follow(x, y, z):
-    """Move smoothly to (x, y, z), turning at up to ~50 degrees a second, without look_at's perk: for keeping the
-    camera on a face (see aim)."""
-    def keys(ref, bounds):
-        dr, da, dz = toward(ref, x, y, z)
-        return [K(max(.4, abs(da) / 50, math.hypot(dr, dz) / 150), dr, da, dz)]
-    return keys
-
-
 def listen(ref, bounds):
     """Attentive: without turning, lean out to 50 mm past the resting pose (less near the edge of the box, or stay
     out if it doesn't fit) and lift the head up 10 mm above rest (or to the top of the box), and stay there. A set distance, not a lean

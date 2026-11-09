@@ -2,6 +2,8 @@
 picture reaches it only when it asks for one (`look`), so seeing costs few tokens.
 
     camera (1280x720, ~30 fps) -> YuNet face detector (OpenCV, CPU, ~10 ms a frame) -> faces: where, how far
+                               -> with no face: a person detector (GPU, ~16 ms) -> where their head is
+                               -> `target`, every frame: what the tracker (track.py) keeps the camera on
                                -> when the arm is still and the picture has changed: Qwen3-VL-2B (GPU, ~4 GB, 1-3 s)
                                   -> a sentence or two, and any hand gesture
 
@@ -14,8 +16,10 @@ face is about FACE_MM wide. Camera calibrated on the arm (2026-11-08): turning t
 none for AWAY_S), "gesture" (a new hand sign, from SIGNS, seen twice in a row), "error". `pose()` is the arm's feedback (motion.py, T:105) while it is still,
 None while it moves: a moving camera's blurred frames are not described, a face it turns toward is not someone
 arriving, and where a face is in the room comes from where the camera was. `view()` is what they last saw still, as
-words for the brain; `snap()` a picture (JPEG) for the `look` tool, `glance()` a small one of now. `nearest` is the face the body
-follows. Frames are never saved.
+words for the brain; `snap()` a picture (JPEG) for the `look` tool, `glance()` a small one of now. `nearest` is the
+face last placed in the room. `target` is, for every frame, moving or not, the face nearest the middle, or with none
+the head of the person nearest it: faces are found only turned toward the camera, people from any side (walking
+away, turned round). Without `describe` (the MCP server) there is no vision model. Frames are never saved.
 """
 
 import glob
@@ -39,6 +43,8 @@ FACES = Path.home() / ".cache/opencv_zoo/face_detection_yunet_2023mar.onnx"  # 2
 FACES_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/" + FACES.name
 FACE_SCORE = 0.8        # on test photos, a face in a picture on the wall scored 0.75, a tulip 0.64, a sweater 0.66
 FACE_MM = 150           # a face's width, near enough for a distance to +-20%
+PERSON_SCORE = 0.6      # the person detector (torchvision's Faster R-CNN, MobileNetV3, 320 px; COCO): 16 ms, 61 MB
+HEAD = 0.28             # a person's head is this share of their box's width below its top (shoulders ~ box width)
 SETTLE_S = 0.5          # after the arm stops, frames this much later are sharp
 EVERY_S = 1             # s between looks at whether the picture changed enough to describe again
 CHANGE = 0.02           # ... enough: this share of a 64x36 grey thumbnail changed by over 30 levels (a raised hand)
@@ -90,6 +96,23 @@ def snapshot() -> bytes:
         cap.release()
 
 
+def person_detector():
+    """frame -> [(x, y) px of each person's head]. On the GPU; the weights (~20 MB) download once to ~/.cache/torch."""
+    import torch
+    from torchvision.models import detection
+    model = detection.fasterrcnn_mobilenet_v3_large_320_fpn(
+        weights=detection.FasterRCNN_MobileNet_V3_Large_320_FPN_Weights.DEFAULT).eval().half().cuda()
+
+    def heads(frame):
+        image = cv2.cvtColor(cv2.resize(frame, (WIDTH // 2, HEIGHT // 2)), cv2.COLOR_BGR2RGB)
+        with torch.inference_mode():
+            out = model([torch.from_numpy(image).cuda().permute(2, 0, 1).half() / 255])[0]
+        return [(float(x0 + x1), float(2 * y0 + HEAD * 2 * (x1 - x0)))  # back to full size: x2
+                for (x0, y0, x1, y1), label, score in zip(out["boxes"].tolist(), out["labels"], out["scores"])
+                if label == 1 and score >= PERSON_SCORE]
+    return heads
+
+
 def locate(face, fb):
     """A face (x, y, w, h px): its angles right and up from where the camera points (radians), its distance (mm), and
     the point to look_at to face it, from the arm's feedback `fb` (still; None without it). That point holds after
@@ -117,8 +140,9 @@ def where(face, fb) -> str:
 
 
 class Eyes:
-    def __init__(self, report, pose=lambda: {}):
-        self.report, self.pose = report, pose
+    def __init__(self, report, pose=lambda: {}, describe=True):
+        self.report, self.pose, self.describe = report, pose, describe
+        self.target = None  # in the latest frame: (when, degrees right, degrees up of the middle, "face" or "person")
         self.lock, self.fresh = threading.Lock(), threading.Condition()
         self.frame, self.frame_t, self.faces = None, 0, []  # the latest frame, when it came, its faces (x, y, w, h)
         self.moved = self.face_t = 0                         # when the arm last moved; a face was last seen
@@ -158,9 +182,11 @@ class Eyes:
                 FACES.parent.mkdir(parents=True, exist_ok=True)
                 urllib.request.urlretrieve(FACES_URL, FACES)
             detect = cv2.FaceDetectorYN.create(str(FACES), "", (WIDTH // 2, HEIGHT // 2), FACE_SCORE)
+            people = person_detector()
             cap = open_camera()
             self.moved = time.monotonic() + 1.5  # the first frames are dark, the exposure still settling: one was a face
-            threading.Thread(target=self._describe, daemon=True).start()
+            if self.describe:
+                threading.Thread(target=self._describe, daemon=True).start()
             while True:
                 ok, frame = cap.read()
                 if not ok:
@@ -170,6 +196,11 @@ class Eyes:
                     self.moved = now
                 _, found = detect.detect(cv2.resize(frame, (WIDTH // 2, HEIGHT // 2)))
                 faces = [tuple(2 * float(v) for v in f[:4]) for f in ([] if found is None else found)]
+                heads = [(x + w / 2, y + h / 2) for x, y, w, h in faces] or people(frame)
+                if heads:  # the one nearest the middle: the one being followed stays there
+                    x, y = min(heads, key=lambda h: math.hypot(h[0] - WIDTH / 2, h[1] - HEIGHT / 2))
+                    self.target = (now, math.degrees(math.atan((x - WIDTH / 2) / FOCAL_PX)),
+                                   math.degrees(math.atan((HEIGHT / 2 - y) / FOCAL_PX)), "face" if faces else "person")
                 still = now - self.moved > SETTLE_S
                 with self.lock:
                     self.frame, self.frame_t, self.faces = frame, now, faces

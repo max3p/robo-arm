@@ -12,6 +12,7 @@ the arm moves to the resting pose START.
 import functools
 import math
 import sys
+import threading
 import time
 from typing import Literal
 
@@ -20,8 +21,9 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from motion import (BASE_KEEPOUT_MM, DEFAULT_SPEED, START, MAX_SPEED, MIN_SPEED, GRIP_CLOSED, GRIP_OPEN, REACH_MAX_MM,
                  REACH_MIN_MM, TOLERANCE_MM, Arm, describe_limits, load_state)
-from eyes import snapshot
+from eyes import Eyes, snapshot
 from gestures import GESTURES, look_at as look_keys
+from track import Tracker
 
 
 STATE = load_state()
@@ -42,6 +44,11 @@ INSTRUCTIONS = (f"Controls a real 4-DOF desk robot arm (Waveshare RoArm-M2-S) th
 
 mcp = MCPServer("robo-arm", instructions=INSTRUCTIONS)
 _arm: Arm | None = None
+_eyes: Eyes | None = None  # the camera and its detectors, from the first start_face_tracking on
+_tracking, _busy = threading.Event(), threading.Event()  # face tracking on; a tool is using the arm
+_hold = 0.0  # following waits until then after a tool turned the arm somewhere
+_back = None  # where the claw was, facing someone, before such a tool: it goes back there if they are out of view
+HOLD_S = 5
 
 
 def arm() -> Arm:
@@ -65,10 +72,19 @@ def tool(description: str):
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            global _hold, _back
+            _busy.set()  # face tracking lets go of the arm within 20 ms, and waits until this is done
+            if _tracking.is_set() and _eyes and _eyes.target and time.monotonic() - _eyes.target[0] < 0.3 \
+                    and fn.__name__ in ("move_to", "move_by", "go_home", "look_at", "play"):
+                _back = arm().read()[:3]
             try:
                 return fn(*args, **kwargs)
             except (ValueError, RuntimeError, OSError) as e:
                 raise ToolError(f"{e}. Current pose: {pose_or_unknown()}") from e
+            finally:
+                if fn.__name__ in ("move_to", "move_by", "go_home", "look_at", "play"):
+                    _hold = time.monotonic() + HOLD_S
+                _busy.clear()
         return mcp.tool(description=description)(wrapper)
     return deco
 
@@ -167,7 +183,46 @@ def play(name: str, speed: float = DEFAULT_SPEED) -> dict:
 @tool("A picture from the camera on the arm's head, just above the claw, looking wherever the claw faces. It does not "
       "move the arm; turn it first (look_at, move_to) to see somewhere else.")
 def look() -> Image:
-    return Image(data=snapshot(), format="jpeg")
+    return Image(data=_eyes.snap() if _eyes else snapshot(), format="jpeg")
+
+
+def follow_people() -> None:
+    """While face tracking is on and no tool is using the arm, keep the camera on whoever it sees (track.py)."""
+    global _back
+    tracker = Tracker(arm(), _eyes)
+    while True:
+        target, ready = _eyes.target, _tracking.is_set() and not _busy.is_set() and time.monotonic() > _hold
+        try:
+            if ready and target and time.monotonic() - target[0] < 0.3:
+                _back = None
+                tracker.run(lambda: _tracking.is_set() and not _busy.is_set())
+            elif ready and _back:  # turned away by a tool, and no one in view: back to where it faced them
+                arm().go_to(*_back)
+                _back = None
+        except Exception as e:  # stopped, or a limit: it starts again when it next sees someone
+            print(f"face tracking: {e}", file=sys.stderr)
+            _back = None
+        time.sleep(0.05)
+
+
+@tool("Start face tracking: from now on, whenever the camera sees a person, the arm keeps it on their face (or on "
+      "their head, turned away) by itself, turning and tilting in real time as they move, within the limits. Other "
+      f"tools pause it while they run; after a move or look_at it waits {HOLD_S} s, then turns back to them (to where "
+      "it faced them, if they are out of view). The first "
+      "call opens the camera and loads the detectors (~5 s).")
+def start_face_tracking() -> dict:
+    global _eyes
+    if _eyes is None:
+        _eyes = Eyes(lambda kind, **info: print(f"eyes: {kind} {info}", file=sys.stderr), lambda: None, describe=False)
+        threading.Thread(target=follow_people, daemon=True).start()
+    _tracking.set()
+    return {"face_tracking": True}
+
+
+@tool("Stop face tracking: the arm stays where it is and moves only when told.")
+def stop_face_tracking() -> dict:
+    _tracking.clear()
+    return {"face_tracking": False}
 
 
 if __name__ == "__main__":
