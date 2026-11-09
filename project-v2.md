@@ -99,7 +99,7 @@ in control:
 | File | Role |
 |---|---|
 | `motion.py` | Motion API: `Arm.go_to` (straight-line, safety-checked, sag-corrected), `gripper`, `play(points)`, `led`, `read`, `free`, `lock`; `perform(keys, size)` plays a gesture (see below); `abort` (a `threading.Event`: set from any thread, the move in progress holds the claw where it is and raises `Interrupted` within 20 ms); `check_target`; `describe_limits`; `load_state`/`save_state`; all tuned constants with the measurements behind them. **Never prints or prompts**: stdout carries the MCP protocol |
-| `arm.py` | The pet chat (Phase 2.5): prompt, brain loop, body thread, the tools and the system prompt. Knobs at the top: `MODEL`, `EFFORT`, `IDLE_GAP_S`, `TICK_S`, `TRACK_DEG`, `HUSH_S`, `MOODS` (idle, Phase 2.7), `PERSON` |
+| `arm.py` | The pet chat (Phase 2.5): prompt, brain loop, body thread, the tools and the system prompt. Knobs at the top: `MODEL`, `EFFORT`, `IDLE_GAP_S`, `TICK_S`, `TRACK_DEG`, `HUSH_S`, `MOODS` (idle, Phase 2.7), `LOST_S`, `SCAN_DEG` |
 | `ears.py` | Speech in (Phase 2.6): mic thread, Silero voice detector, faster-whisper on the GPU. Knobs at the top: `MIC`, `STT_MODEL`, `SILENCE_S`, `MIN_SPEECH_S`, `SURE_LOGPROB`, `MIN_LOGPROB` |
 | `cli.py` | Human REPL. Commands: `read`, `move`, `grip` (radians), `home`, `led`, `bounds` (free the arm and sweep the claw; samples every 100 ms; the min/max becomes the box), `trace` (show the 6 faces of the box), `record NAME` (Enter per point, q to save; one point = a pose), `play NAME`, `gesture NAME [size]`, `look x y z`, `paths`, `delete NAME`. Ctrl-C stops motion |
 | `gestures.py` | The gestures as data: keyframes `K(secs, dr, da, dz, grip, led)` relative to the current pose (dr out from the base axis, da degrees of base turn, dz up), plus functions for the aimed ones (`sleep`, `wake_up`, `look_at`) |
@@ -369,7 +369,7 @@ keystrokes into `main()` (scratch script, not in the repo).
 
 **Not yet checked:**
 - Whether lean_in, calm and yawn look smooth at their slow speeds.
-- `PERSON` (600, 0, 300) is a guess at where the user sits. Measure it.
+- `PERSON` (600, 0, 300) was a guess at where the user sits. Since Phase 3.2 there is none: the camera finds them.
 
 ## Phase 2.6: speech in, `ears.py` (built 2026-11-07)
 
@@ -729,12 +729,51 @@ All of it is in the body thread, so it makes no API calls.
 - **Moods.** The quiet clock now resets on a follow step too: someone moving in view is something happening. A
   person sitting still and silent does not reset it, so after 30 s it gets bored and looks around, as asked for
   "inactivity". If they move, it follows them and is curious again. Curious with a face in view, it doesn't glance
-  away; it may tilt, perk at them (`look`) or play curious. `look` aims at the face last seen, else `PERSON`.
+  away; it may tilt, perk at them (`look`) or play curious. `look` aims at the face last seen, else it glances.
 - **Tested on the real arm** (2026-11-08, body and eyes only, 90 s, the user at the desk): it found the user 28°
   off and turned to them within 0.5 s. It followed them as they moved, played curious, tilt and look at them in
   between, got bored at 30 s with them sitting still, looked away, and found them again. With tilting and the
   limits (75 s): steps of 20-30 mm, and no back and forth with the arm still. Where the face's reading jumped, it was
   moving: it went from 9° to 17° right over 2 s with the arm standing still.
+
+## Phase 3.2: finding the person (built 2026-11-08)
+
+The user's session (`logs/2026-11-08_16-45-32`, 3.5 min, in the bigger box): "it had a lot of trouble finding me
+and tracking me. It kept turning away to the right, when I was to the left." Why:
+- **The brain thought the person sat straight ahead.** The prompt said "your person is usually around
+  `PERSON` (600, 0, 300)". Their face was at about (940, 450, 300) in both of that day's sessions, ~27° to the left.
+  The brain looked_at `PERSON` twice.
+- **It guessed coordinates.** Asked "can you look at me?", with the camera's point for the face to the left
+  ((1131, 264), then (721, 634)), Haiku chose look_at(600, -250, 250): to the right. It did so twice more.
+- **Turning to a speaker failed 5 times.** The turn when speech starts is look_at the face's point. look_at moved
+  half way to the point's height, and a standing face read 750-960 mm up, so with the box's top at 511 it went out
+  of reach. Its 35 mm perk also failed with the claw already far out.
+- **Following hardly ran.** It only works while the brain is not moving the arm: 8 steps in 3.5 min, the first one
+  right (35° left). Once the brain's moves had turned the camera off the face, nothing brought it back.
+- Also: "holding" (the user holding a plush octopus) woke the brain three times as a hand gesture.
+
+The user ruled out a fixed point for the person ("it should track this itself, the person can move all around").
+**Changes:**
+- **No `PERSON`.** The prompt tells the brain to call `look_at_person` to look at its person, never to guess where
+  they are, and to keep look_at for things and places.
+- **`look_at_person`** (`seek` in arm.py) turns to the face the camera last saw (the eyes' `nearest`). If no face is
+  in view there, it looks round: 45° left, 45° right, then 90° and 135° each way, about 15° up for a seated or
+  standing face, and stops at the first face. While the body is busy the eyes don't place faces, so it reads the
+  camera's latest faces itself, 0.5 s after each stop. A newer reply cuts it short.
+- **`look_at` turns and tilts the camera to face the point,** with `aim`, and perks up only if there is room. The
+  tilt it needs depends on where the claw ends up, so it is found in half steps (whole ones overshot): within 2° on
+  40 test cases (5 poses including high and turned round, 8 points including the session's standing faces, behind
+  and below). The brain may now give points up to 5 m away, since standing faces read past the old 1 m limit. The
+  MCP server's look_at is the same.
+- **Looking again where they were.** When a face seen less than `LOST_S` (60 s) ago is out of view, the next idle
+  fidget turns to where it was, once for each sighting. That comes before going home or glancing.
+- **Hand signs from a fixed list** (`SIGNS`: thumbs up, thumbs down, wave, come here, stop, pointing), named in the
+  vision model's prompt. A sign wakes the brain only if it is in two descriptions in a row. A sign seen once is
+  described again straight away, changed or not, so a held thumbs-up is confirmed in one more pass (~2 s).
+  Anything else ("holding", "thinking") is no sign. On the five test photos it named both thumbs-ups and the wave,
+  and none for the desk and the stretch.
+- **Tested:** on the real arm, with the user away (empty chair), `look_at_person` from 90° right looked all round
+  and reported no face. Finding and facing a real person is still to test.
 
 ## Constraints
 

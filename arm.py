@@ -52,7 +52,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from dance import DANCE_S, dance
 from ears import Ears
-from eyes import Eyes
+from eyes import SETTLE_S, Eyes, locate
 from motion import (DEFAULT_SPEED, GRIP_CLOSED, GRIP_OPEN, MAX_SPEED, MIN_SPEED, START, Arm, Interrupted,
                     check_target, describe_limits, load_state)
 from gestures import GESTURES, aim, follow, listen, look_at
@@ -67,7 +67,7 @@ TRACK_DEG = 8         # a face in view further than this off the camera's axis (
 TRACK_GAIN = 0.7      # ... this much of the way: all of it overshot, as faces' angles and distances are rough
 HUSH_S = 8            # s: someone starting to talk holds off idling this long (the brain answers ~2 s after they stop)
 MOODS = [  # (s of nothing happening: no movement from the brain, no one moving in view; what the brain is told;
-    # fidgets picked at random: a gesture, "glance" somewhere random, "look" at the face last seen (or PERSON), "home"
+    # fidgets picked at random: a gesture, "glance" somewhere random, "look" at the face last seen (or glance), "home"
     # to rest; listing one twice makes it likelier). Curious, it doesn't glance away from a face in view or go home.
     (0, "you are curious, watching", ["glance", "glance", "look", "tilt", "curious"]),  # not told: it's every turn
     (30, "you are getting bored, fidgeting and looking for your person",
@@ -77,7 +77,8 @@ MOODS = [  # (s of nothing happening: no movement from the brain, no one moving 
 ]
 WAKE = "gesture(wake_up)"  # the label of the wake_up action, which nothing but stop cuts short
 NAME = re.compile(r"\b(robert|rob)\b", re.I)  # asleep, only speech with its name wakes it; the rest is ignored
-PERSON = (600, 0, 300)  # mm: where the person usually is, so the arm can look at them. A guess: measure and adjust
+LOST_S = 60          # s: a face lost from view less than this long ago is looked for again where it was
+SCAN_DEG = (45, -45, 90, -90, 135, -135)  # look_at_person, when no face is where it last saw one: turns to try, in order
 RUN = Path(__file__).with_name("logs") / time.strftime("%Y-%m-%d_%H-%M-%S")  # this run's transcript
 T0 = time.monotonic()
 
@@ -123,14 +124,16 @@ went when something new happens; a refused or failed movement wakes you at once.
 - The first movement of a reply replaces whatever movement is still playing from before. To stop moving, call `stop`.
 - If your person speaks while you are still replying, your reply is cut off and you are told what you had already \
 done. Carry on from there without repeating yourself.
-- Your person is usually in front of you, around (x, y, z) = {PERSON} mm: look_at that to look at them, or \
-better, the point your camera gives for their face. Gestures play \
+- To look at your person, call look_at_person: your body turns to where your camera last saw a face, and looks \
+round for one if no one is there. Never guess where your person is: they move about. look_at is for things and \
+places. Gestures play \
 facing wherever you face, and the ones that reach out (lean_in, curious, play_bow, greet) reach that way, so face \
 your person first when a gesture is meant for them.
 - You rest at {START} mm, folded back over your base (go_home). When things calm down, settle back there, like a pet \
 lying down again.
 - Between your movements your body carries on by itself: it keeps your camera on the nearest face, turns to your \
-person when they start talking, and looks around curiously when no one is in view. So you need not turn to follow \
+person when they start talking, looks for them again where it last saw them when it has lost them, and looks around \
+curiously when no one is in view. So you need not turn to follow \
 them yourself. When nothing happens for a while it gets bored, then sleepy, and in the end falls asleep. You are told when that mood changes; you need not act on it. Asleep (by yourself, or when \
 told to sleep), you hear nothing at all until someone says your name; that wakes you (wake_up plays by itself), and \
 you hear what they said.
@@ -156,9 +159,10 @@ TOOLS = [
          + ". All but sleep and wake_up end where they started. One that does not fit where the claw is moves toward "
          "the middle of your space to play, and comes back after.", ["name"],
          name={"type": "string", "enum": list(GESTURES)}),
-    tool("look_at", "Turn to face the point (x, y, z) mm and move half way to its height, then perk up and lean toward "
-         "it for a moment. It does not reach for it, and stays facing it. The point may be outside the limits.",
-         ["x", "y", "z"], **XYZ),
+    tool("look_at", "Turn and tilt your camera to face the point (x, y, z) mm, then perk up toward it for a moment. It "
+         "does not reach for it, and stays facing it. The point may be outside the limits.", ["x", "y", "z"], **XYZ),
+    tool("look_at_person", "Turn your camera to your person's face: to where it last saw a face, and if no one is "
+         "there, look round until it finds one. Use this whenever you mean to look at them."),
     tool("move_to", "Move the claw in a straight line to (x, y, z) mm.", ["x", "y", "z"], **XYZ, speed=SPEED),
     tool("go_home", f"Go back to the resting pose {START} mm, gripper shut.", speed=SPEED),
     tool("gripper", "Open or shut the claw: 0 = shut .. 1 = wide.", ["opening"], opening=num("0-1")),
@@ -191,7 +195,7 @@ def body_action(arm: Arm, name: str, a: dict, ears=None, eyes=None):
     """Check a body tool's input now; return what the body thread will run later. Raises ValueError on bad input.
     A move_to target outside the box is refused here, so the reason goes back in its tool result (refused later, it
     woke the brain and cut off the reply still being written). The rest is checked by motion.py when it runs."""
-    xyz = lambda: [number(a, k, -1000, 1000) for k in "xyz"]
+    xyz = lambda: [number(a, k, -5000, 5000) for k in "xyz"]
     speed = lambda: number(a, "speed", MIN_SPEED, MAX_SPEED, DEFAULT_SPEED)
     if name == "gesture":
         if a.get("name") not in GESTURES:
@@ -201,6 +205,10 @@ def body_action(arm: Arm, name: str, a: dict, ears=None, eyes=None):
     if name == "look_at":
         keys = look_at(*xyz())
         return lambda: arm.perform(keys)
+    if name == "look_at_person":
+        if eyes is None:
+            raise ValueError("you cannot see: the eyes are off")
+        return lambda: seek(arm, eyes)
     if name == "move_to":
         (x, y, z), s = xyz(), speed()
         check_target(arm.bounds, x, y, z)
@@ -235,6 +243,28 @@ def body_action(arm: Arm, name: str, a: dict, ears=None, eyes=None):
     raise ValueError(f"no tool {name!r}")
 
 
+def seek(arm: Arm, eyes) -> str:
+    """look_at_person: turn to the face the camera last saw; if no face is in view there, look round (SCAN_DEG) and
+    stop at the first one. Faces are read straight from the camera: the eyes only place them while the body is idle."""
+    def face():  # the biggest face in a sharp frame from now on: its look_at point, or None
+        after = time.monotonic() + SETTLE_S
+        pause(arm, SETTLE_S + 0.3)
+        with eyes.lock:
+            faces, frame_t = eyes.faces, eyes.frame_t
+        return locate(max(faces, key=lambda f: f[2]), arm._feedback())[3] if faces and frame_t > after else None
+    if eyes.nearest:
+        arm.perform(look_at(*eyes.nearest[3]))
+    fb = arm._feedback()
+    yaw, z = math.atan2(fb["y"], fb["x"]), fb["z"] + 270  # looking round ~15 degrees up, for a seated or standing face
+    for turn in (0, *SCAN_DEG):
+        if turn:
+            arm.perform(look_at(1000 * math.cos(yaw + math.radians(turn)), 1000 * math.sin(yaw + math.radians(turn)), z))
+        if point := face():
+            arm.perform(look_at(*point))
+            return "found a face and faced it"
+    return "looked all round: no face in view"
+
+
 def show(text: str, dim=False) -> None:
     print(f"\033[2m{text}\033[0m" if dim else text, flush=True)
 
@@ -263,6 +293,7 @@ class Body:
         self.since, self.mood, self.last = time.monotonic(), -1, None  # when the brain last moved it; idle state
         self.hushed = 0  # when someone last started talking
         self.stopped, self.next, self.track_t = 0, 0, 0  # when the last action ended; the next fidget; no follow before
+        self.sought = None  # the sighting (its time) last looked for again
         threading.Thread(target=self._run, daemon=True).start()
 
     def hush(self) -> None:
@@ -379,6 +410,10 @@ class Body:
         if now < self.next or now - self.hushed < HUSH_S:
             return
         self.next = now + random.uniform(*IDLE_GAP_S)
+        if face and not in_view and now - face[0] < LOST_S and face[0] != self.sought:  # lost them: look where they were
+            self.sought, self.gen = face[0], None
+            self.todo.append(("idle: find", lambda: self.arm.perform(look_at(*face[3]))))
+            return self.idling("find the face last seen")
         what = "home" if self.away and not in_view else random.choice(
             [w for w in MOODS[mood][2] if w != self.last] or MOODS[mood][2])
         if in_view and mood == 0 and what == "glance":  # watching someone: keep at it
@@ -387,11 +422,13 @@ class Body:
         if what == "home":
             fn = lambda: self.arm.go_to(*START, SETTLE_SPEED, GRIP_CLOSED)
         else:
+            if what == "look" and not face:  # no face seen yet
+                what = "glance"
             if what == "glance":  # anywhere round, high or low (-30 to 40 degrees in the box drawn 2026-11-07)
                 a, r = math.radians(random.uniform(-150, 150)), random.uniform(400, 800)
                 keys = look_at(r * math.cos(a), r * math.sin(a), random.uniform(0, 400))
             else:
-                keys = look_at(*(face[3] if face else PERSON)) if what == "look" else GESTURES[what][1]
+                keys = look_at(*face[3]) if what == "look" else GESTURES[what][1]
             fn = lambda: self.arm.perform(keys)
         self.gen = None  # so the next reply's first movement replaces it
         self.todo.append((f"idle: {what}", fn))

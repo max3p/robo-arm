@@ -64,7 +64,7 @@ use. The bounds are saved to `arm_state.json`.
 
 | File | What it does |
 |---|---|
-| [arm.py](arm.py) | The pet. The brain (Claude, streaming tool calls) and the body thread (actions, idling, moods, sleep). Settings at the top: `MODEL`, `MOODS`, `NAME`, `PERSON` |
+| [arm.py](arm.py) | The pet. The brain (Claude, streaming tool calls) and the body thread (actions, idling, moods, sleep). Settings at the top: `MODEL`, `MOODS`, `NAME`, `TRACK_DEG` |
 | [ears.py](ears.py) | Speech in. The mic, a voice detector and Whisper on the GPU |
 | [eyes.py](eyes.py) | Sight in. The camera, a face detector, and a small vision model on the GPU that describes the scene |
 | [dance.py](dance.py) | Dancing: finds the beat in what the mic hears and bobs the arm to it |

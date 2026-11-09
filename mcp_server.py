@@ -147,9 +147,9 @@ def gesture(name: Literal[tuple(GESTURES)], size: float = 1) -> dict:
     return pose() | {"size_used": round(used, 2), "slid_mm": round(slid)}
 
 
-@tool("Turn to face the point (x, y, z) mm, like looking at it: the base turns toward it and the claw moves half way "
-      "to its height, then perks up slightly. It does not reach for it (use move_to for that) and stays facing it. "
-      "The point itself may be outside the limits; if the turn does not fit it turns part of the way.")
+@tool("Turn and tilt the camera above the claw to face the point (x, y, z) mm, like looking at it, then perk up "
+      "slightly if there is room. It does not reach for it (use move_to for that) and stays facing it. The point itself "
+      "may be outside the limits; if the turn or tilt does not fit it goes as far as it can.")
 def look_at(x: float, y: float, z: float) -> dict:
     _, used, _ = arm().perform(look_keys(x, y, z))
     return pose() | {"turned_fraction": round(used, 2)}

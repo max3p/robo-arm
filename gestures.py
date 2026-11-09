@@ -54,13 +54,27 @@ def wake_up(ref, bounds):
 
 
 def look_at(x, y, z):
-    """Turn the base to face (x, y, z) and move half way to its height, then perk up and lean toward it for a moment
-    (so it reads even when already facing it). Stays facing it."""
+    """Turn and tilt the camera to face (x, y, z) (see aim), then perk up and lean toward it for a moment, if there is
+    room (so it reads even when already facing it). Stays facing it. It used to move half way to the point's height:
+    in the bigger box a standing person's face (z ~900) sent it out of reach, so it never turned to them (2026-11-08)."""
     def keys(ref, bounds):
-        _, da, _ = toward(ref, x, y, z)
-        dz = 2 * (clamp((ref[2] + z) / 2, *bounds["z"]) - ref[2])  # leaves room for the perk inside the box
-        return [K(.7, da=da, dz=dz / 2), K(.3, dr=35, da=da, dz=dz / 2 + 12), K(.4, dr=35, da=da, dz=dz / 2 + 12),
-                K(.4, da=da, dz=dz / 2)]
+        p0, goal = pitch(math.hypot(*ref[:2]), ref[2]), ref
+        up = math.degrees(math.atan2(z - ref[2], math.hypot(x - ref[0], y - ref[1]))) - p0
+        for _ in range(8):  # the tilt it needs is from where the claw ends up: half steps, as whole ones overshot
+            goal = aim(bounds, ref, math.degrees(math.atan2(y, x)), up, step=2000) or ref
+            miss = (math.degrees(math.atan2(z - goal[2], math.hypot(x - goal[0], y - goal[1])))
+                    - pitch(math.hypot(*goal[:2]), goal[2]))
+            if abs(miss) < 1:
+                break
+            up += miss / 2
+        dr, da, dz = toward(ref, *goal)
+        turn = [K(max(.7, abs(da) / 60, math.hypot(dr, dz) / 150), dr, da, dz)]
+        a, r = math.atan2(goal[1], goal[0]), math.hypot(*goal[:2]) + 35
+        try:
+            check_target(bounds, r * math.cos(a), r * math.sin(a), goal[2] + 12)
+        except ValueError:
+            return turn
+        return turn + [K(.3, dr + 35, da, dz + 12), K(.4, dr + 35, da, dz + 12), K(.4, dr, da, dz)]
     return keys
 
 

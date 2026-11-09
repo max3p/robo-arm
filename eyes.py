@@ -11,7 +11,7 @@ face is about FACE_MM wide. Camera calibrated on the arm (2026-11-08): turning t
 143 px, so FOCAL_PX (76 degrees across); not mirrored; it tilts with the forearm, level when shoulder + elbow = 90.
 
 `report(kind, **info)` is called from the eyes' threads: "ready", "seen" (a new description), "arrived" (a face, after
-none for AWAY_S), "gesture" (a new one), "error". `pose()` is the arm's feedback (motion.py, T:105) while it is still,
+none for AWAY_S), "gesture" (a new hand sign, from SIGNS, seen twice in a row), "error". `pose()` is the arm's feedback (motion.py, T:105) while it is still,
 None while it moves: a moving camera's blurred frames are not described, a face it turns toward is not someone
 arriving, and where a face is in the room comes from where the camera was. `view()` is what they last saw still, as
 words for the brain; `snap()` a picture (JPEG) for the `look` tool, `glance()` a small one of now. `nearest` is the face the body
@@ -46,8 +46,12 @@ AWAY_S = 20             # a face after none for this long is someone arriving
 LOOK_WIDTH = 800        # px: the picture for `look`, ~600 tokens
 GLANCE_WIDTH = 448      # px: the picture sent with what a person says or does, ~190 tokens
 PROMPT = ('Reply with JSON only: {"people": <the number of people visible, often 0>, "scene": "<one or two short '
-          'sentences on what is in view, and where (left, centre or right; near or far)>", "gesture": "<a hand gesture '
-          'a person makes at the camera (thumbs up, wave, pointing, ...), or none>"}')
+          'sentences on what is in view, and where (left, centre or right; near or far)>", "gesture": "<a hand sign a '
+          'person makes at the camera: thumbs up, thumbs down, wave, come here, stop, pointing, or none>"}')
+SIGNS = {"thumbs up": r"thumbs? up", "thumbs down": r"thumbs? down", "wave": r"wav", "come here": r"come here|beckon",
+         "stop": r"\bstop\b", "pointing": r"point"}  # what it may say -> the sign. Anything else is no sign: free to
+# name one, it also said "holding", "thinking", "smiling", "hands on hips" and a sentence, each of which woke the brain
+# (2026-11-08). A sign must also be in two descriptions in a row: one "pointing" in six was a person pointing.
 # Counting people first stopped it making them up: asked "who and what is in view", it saw "a man leaning over a desk"
 # at an empty chair (2026-11-08). Saying whose camera it was made it see a "robot pet" in every picture.
 
@@ -86,7 +90,7 @@ def snapshot() -> bytes:
         cap.release()
 
 
-def aim(face, fb):
+def locate(face, fb):
     """A face (x, y, w, h px): its angles right and up from where the camera points (radians), its distance (mm), and
     the point to look_at to face it, from the arm's feedback `fb` (still; None without it). That point holds after
     the arm moves; the rest does not."""
@@ -101,8 +105,8 @@ def aim(face, fb):
 
 
 def where(face, fb) -> str:
-    """A face in words (see aim)."""
-    right, up, d, p = aim(face, fb)
+    """A face in words (see locate)."""
+    right, up, d, p = locate(face, fb)
     w = face[2]
     out = (f"a face {abs(math.degrees(right)):.0f} deg {'right' if right > 0 else 'left'}, "
            f"{abs(math.degrees(up)):.0f} deg {'up' if up > 0 else 'down'} from straight ahead, about {d / 1000:.1f} m "
@@ -172,7 +176,7 @@ class Eyes:
                     if still:
                         self.found, self.found_t = "; ".join(where(f, fb) for f in faces) or "none in view", now
                         if faces and fb.get("s") is not None:
-                            right, up, _, p = aim(max(faces, key=lambda f: f[2]), fb)
+                            right, up, _, p = locate(max(faces, key=lambda f: f[2]), fb)
                             self.nearest = now, math.degrees(right), math.degrees(up), p
                 with self.fresh:
                     self.fresh.notify_all()
@@ -191,7 +195,7 @@ class Eyes:
             model = AutoModelForImageTextToText.from_pretrained(VLM, dtype=torch.float16, device_map="cuda")
             processor = AutoProcessor.from_pretrained(VLM)
             self.report("ready", camera=CAMERA, model=VLM)
-            last, gesture = None, None  # the thumbnail and the gesture of the last frame described
+            last, sign, told = None, None, None  # the last frame described: its thumbnail, its sign; the sign last told
             while True:
                 time.sleep(EVERY_S)
                 with self.lock:
@@ -199,7 +203,8 @@ class Eyes:
                 if frame_t - self.moved < SETTLE_S:
                     continue
                 thumb = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (64, 36), interpolation=cv2.INTER_AREA)
-                if last is not None and n == last[1] and np.mean(cv2.absdiff(thumb, last[0]) > 30) < CHANGE:
+                if (last is not None and n == last[1] and np.mean(cv2.absdiff(thumb, last[0]) > 30) < CHANGE
+                        and sign in (None, told)):  # a sign seen once is looked at again at once, changed or not
                     continue
                 last, t = (thumb, n), time.monotonic()
                 image = Image.fromarray(cv2.cvtColor(cv2.resize(frame, (640, 360)), cv2.COLOR_BGR2RGB))
@@ -212,15 +217,16 @@ class Eyes:
                 text = processor.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
                 try:
                     said = json.loads(re.search(r"\{.*\}", text, re.S).group())
-                    scene, new = str(said["scene"]).strip(), str(said.get("gesture", "")).strip().lower()
+                    scene, raw = str(said["scene"]).strip(), str(said.get("gesture", "")).lower()
                 except (AttributeError, ValueError, KeyError, TypeError):  # not the JSON asked for: keep its words
-                    scene, new = text.strip(), ""
-                new = None if new in ("", "none", "no", "null", "n/a") else new
+                    scene, raw = text.strip(), ""
+                new = next((s for s, pattern in SIGNS.items() if re.search(pattern, raw)), None)
                 with self.lock:
                     self.said, self.said_t = scene, frame_t
                 self.report("seen", text=scene, gesture=new, secs=round(time.monotonic() - t, 2))
-                if new and new != gesture:
+                if new and new == sign and new != told:
                     self.report("gesture", gesture=new)
-                gesture = new
+                    told = new
+                told, sign = told if new else None, new
         except Exception as e:
             self.report("error", error=f"{type(e).__name__}: {e}")
